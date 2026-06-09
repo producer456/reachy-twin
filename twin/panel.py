@@ -139,6 +139,11 @@ def post_center():
     return {"pose": hub.center()}
 
 
+@app.get("/api/servos")
+def get_servos():
+    return hub.servos()
+
+
 def main():
     uvicorn.run(app, host="127.0.0.1", port=8500, log_level="warning")
 

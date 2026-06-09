@@ -49,6 +49,8 @@ class RobotHub:
         self._last_doa_turn = 0.0
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
         self._last_face = 0.0
+        self._cached_mode = "?"    # /api/motors/status is slow (~2s) -> cache it
+        self._mode_ts = 0.0
         self._cascade = None       # opencv face detector (lazy)
         self._pose = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "body": 0.0, "ant": 0.0}  # degrees
 
@@ -247,9 +249,11 @@ class RobotHub:
                 self._turn_to_sound_tick()
             time.sleep(0.06)
 
+    HEAD_LOOK_MAX = 0.6   # rad (~34 deg) the head will glance before the body helps
+
     def _turn_to_sound_tick(self):
         now = time.time()
-        if now - self._last_doa_turn < 0.8:          # at most ~1 turn/sec
+        if now - self._last_doa_turn < 0.6:
             return
         try:
             with self._lock:
@@ -261,14 +265,18 @@ class RobotHub:
         angle, speech = doa
         if not speech:
             return
-        delta = angle - (np.pi / 2)                  # front of robot = pi/2
-        if abs(delta) < 0.3:                         # ignore near-front / jitter
+        delta = angle - (np.pi / 2)                  # offset from front (rad)
+        if abs(delta) < 0.2:                         # ignore near-front jitter
             return
-        target = self._body_yaw + self.doa_sign * delta
-        target = max(-2.7, min(2.7, target))         # keep within +/-160 deg
+        from reachy_mini.utils import create_head_pose
+        desired = self.doa_sign * delta              # turn this much toward the source
+        head_yaw = max(-self.HEAD_LOOK_MAX, min(self.HEAD_LOOK_MAX, desired))  # head glances first
+        body_add = desired - head_yaw                # body covers the rest for big angles
+        target_body = max(-2.7, min(2.7, self._body_yaw + body_add))
+        head = create_head_pose(yaw=float(np.rad2deg(head_yaw)), degrees=True)
         with self._lock:
-            self.mini.goto_target(body_yaw=target, duration=0.5)
-        self._body_yaw = target
+            self.mini.goto_target(head=head, body_yaw=target_body, duration=0.4)
+        self._body_yaw = target_body
         self._last_doa_turn = now
 
     def _detect_faces(self, frame):
@@ -344,15 +352,40 @@ class RobotHub:
         return buf.tobytes() if ok else None
 
     _JOG_LIMITS = {"pitch": 30, "roll": 30, "yaw": 60, "body": 90, "ant": 90}  # degrees
+    ANT_REST_DEG = 8   # antennas held at exactly 0 deg hunt (backlash); a small offset stops it
 
     def _apply_pose(self):
         from reachy_mini.utils import create_head_pose
         p = self._pose
         head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
+        ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
         with self._lock:
             self.mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
-                                  antennas=np.deg2rad([p["ant"], p["ant"]]), duration=0.35)
+                                  antennas=ant, duration=0.35)
         return dict(self._pose)
+
+    def servos(self):
+        """Live motor telemetry for the panel. Joint positions come from the SDK's WS
+        client (fast); the REST /api/motors/status is slow (~2s) so we cache the mode."""
+        out = {"mode": self._cached_mode, "body_yaw": None, "antenna_left": None, "antenna_right": None}
+        try:
+            with self._lock:
+                head, ant = self.mini.get_current_joint_positions()
+            out["body_yaw"] = round(float(np.rad2deg(head[0])), 1)   # head[0] = body yaw
+            out["antenna_left"] = round(float(np.rad2deg(ant[0])), 1)
+            out["antenna_right"] = round(float(np.rad2deg(ant[1])), 1)
+        except Exception:
+            pass
+        now = time.time()
+        if now - self._mode_ts > 10:
+            try:
+                self._cached_mode = json.loads(
+                    urllib.request.urlopen(DAEMON + "/api/motors/status", timeout=3).read()).get("mode")
+            except Exception:
+                pass
+            self._mode_ts = now
+        out["mode"] = self._cached_mode
+        return out
 
     def jog(self, part, delta):
         if part in self._pose:
@@ -363,6 +396,7 @@ class RobotHub:
     def center(self):
         for k in self._pose:
             self._pose[k] = 0.0
+        self._body_yaw = 0.0          # keep turn-to-sound's tracking in sync after a recenter
         return self._apply_pose()
 
     # ---------- volume (proxy daemon) ----------

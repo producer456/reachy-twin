@@ -37,6 +37,10 @@
   .jog button{padding:8px 0;font-size:13px}
   .jog .sp{visibility:hidden}
   .jog2{display:flex;gap:5px;margin-top:5px}
+  .servos{display:none;margin-top:8px;font-size:13px;font-family:ui-monospace,monospace}
+  .servos .sv{display:flex;justify-content:space-between;padding:2px 0}
+  .servos .sv span:first-child{color:var(--dim)}
+  .servos .sv.moving span{color:var(--marcus);font-weight:600}
   .grp label{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim)}
   .row{display:flex;gap:8px;margin-top:8px}
   button{cursor:pointer;border:1px solid var(--line);background:#1c2138;color:var(--txt);
@@ -121,6 +125,11 @@
         <button onclick="jog('ant',15)">Ant &uarr;</button>
         <button onclick="jog('ant',-15)">Ant &darr;</button>
       </div>
+    </div>
+    <div class="grp">
+      <label>Servos</label>
+      <div class="row"><button id="servoBtn" onclick="toggleServos()">Show servo activity</button></div>
+      <div id="servos" class="servos"></div>
     </div>
     <div class="grp" style="flex:1;min-height:0;display:flex;flex-direction:column">
       <label>Expressions</label>
@@ -207,6 +216,26 @@ function toggleCam(){
 }
 async function jog(part,delta){ try{ await api('/api/jog',{part,delta}); }catch(e){} }
 async function center(){ try{ await api('/api/center',{x:1}); }catch(e){} }
+let servoTimer=null, lastServo={};
+function toggleServos(){
+  const el=$('servos');
+  if(servoTimer){ clearInterval(servoTimer); servoTimer=null; el.style.display='none'; $('servoBtn').textContent='Show servo activity'; return; }
+  el.style.display='block'; $('servoBtn').textContent='Hide servo activity';
+  servoTimer=setInterval(pollServos,350); pollServos();
+}
+async function pollServos(){
+  try{
+    const s=await api('/api/servos');
+    const rows=[['mode',s.mode],['body yaw',s.body_yaw==null?'-':s.body_yaw+'°'],
+                ['antenna L',s.antenna_left==null?'-':s.antenna_left+'°'],
+                ['antenna R',s.antenna_right==null?'-':s.antenna_right+'°']];
+    $('servos').innerHTML = rows.map(([k,v])=>{
+      const moved = (k in lastServo) && lastServo[k]!==v && k.indexOf('antenna')===0;
+      lastServo[k]=v;
+      return `<div class="sv${moved?' moving':''}"><span>${k}</span><span>${v}</span></div>`;
+    }).join('');
+  }catch(e){}
+}
 setInterval(refresh,1500); refresh(); loadMoves();
 </script>
 </body>
