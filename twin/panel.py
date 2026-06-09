@@ -4,6 +4,7 @@ Run with the daemon already running:
     python -m twin.panel
 Then open http://127.0.0.1:8500
 """
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -142,7 +143,8 @@ def get_servos():
 
 
 def main():
-    uvicorn.run(app, host="127.0.0.1", port=8500, log_level="warning")
+    host = os.environ.get("REACHY_PANEL_HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=8500, log_level="warning")
 
 
 if __name__ == "__main__":
