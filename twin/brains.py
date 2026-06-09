@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import urllib.request
+import uuid
 
 from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MARCUS_URL
 
@@ -106,7 +107,14 @@ class ClaudeBrain(_ChatBrain):
 
 
 class ClaudeCLIBrain(_ChatBrain):
-    """Claude via the Claude Code CLI -- runs on your subscription, no API key."""
+    """Claude via the Claude Code CLI -- runs on your subscription, no API key.
+
+    Keeps a CLI session id and resumes it each turn, so the CLI carries the
+    conversation instead of us re-rendering the whole history into one prompt
+    (which paid the CLI's cold-start cost AND grew the prompt every turn).
+    Falls back to a fresh session seeded with the rendered history if a resume
+    ever fails (e.g. the session expired server-side).
+    """
     name = "Claude"
     other = "Marcus"
 
@@ -114,6 +122,7 @@ class ClaudeCLIBrain(_ChatBrain):
         super().__init__()
         self.exe = shutil.which("claude") or "claude"
         self.model = model or os.getenv("CLAUDE_CLI_MODEL", "")
+        self.session_id = None
 
     def _render(self) -> str:
         lines = []
@@ -123,20 +132,29 @@ class ClaudeCLIBrain(_ChatBrain):
         lines.append(f"{self.name}:")
         return "\n".join(lines)
 
-    def reply(self, user_text: str) -> str:
-        self._remember("user", user_text)
-        system = SYSTEM_TMPL.format(name=self.name, other=self.other)
-        cmd = [self.exe, "-p", self._render(),
-               "--system-prompt", system,
-               "--exclude-dynamic-system-prompt-sections"]
+    def _run(self, cmd) -> str:
         if self.model:
-            cmd += ["--model", self.model]
+            cmd = cmd + ["--model", self.model]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=90)
-            reply = (r.stdout or "").strip()
-        except Exception as e:
-            reply = f"My CLI brain hiccupped: {e}"
+            return (r.stdout or "").strip()
+        except Exception:
+            return ""
+
+    def reply(self, user_text: str) -> str:
+        self._remember("user", user_text)
+        system = SYSTEM_TMPL.format(name=self.name, other=self.other)
+        common = ["--system-prompt", system, "--exclude-dynamic-system-prompt-sections"]
+        reply = ""
+        if self.session_id:
+            reply = self._run([self.exe, "-p", user_text,
+                               "--resume", self.session_id] + common)
+        if not reply:                       # first turn, or the resume went stale
+            sid = str(uuid.uuid4())
+            reply = self._run([self.exe, "-p", self._render(),
+                               "--session-id", sid] + common)
+            self.session_id = sid if reply else None
         if not reply:
             reply = "Hmm, I blanked for a second. Say that again?"
         self._remember("assistant", reply)

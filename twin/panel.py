@@ -5,7 +5,8 @@ Run with the daemon already running:
 Then open http://127.0.0.1:8500
 """
 import os
-import time
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -18,7 +19,32 @@ from twin.hub import RobotHub
 
 STATIC = Path(__file__).parent / "static"
 hub = RobotHub()
-app = FastAPI()
+
+# The panel must outlive the daemon: connect to the robot in the background and
+# keep retrying, so /api/state can say "robot: disconnected" instead of the whole
+# process dying when the daemon isn't up yet (or restarts).
+_connect_stop = threading.Event()
+
+
+def _connect_loop():
+    while not _connect_stop.is_set() and not hub.robot_connected:
+        try:
+            hub.start()
+        except Exception as e:
+            hub.last_error = str(e)
+            print(f"[panel] robot connect failed: {e} -- retrying in 5s")
+            _connect_stop.wait(5)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    threading.Thread(target=_connect_loop, daemon=True).start()
+    yield
+    _connect_stop.set()
+    hub.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class ChatReq(BaseModel):
@@ -56,16 +82,6 @@ class BehaviorReq(BaseModel):
 class JogReq(BaseModel):
     part: str       # pitch | roll | yaw | body | ant
     delta: float    # degrees
-
-
-@app.on_event("startup")
-def _startup():
-    hub.start()
-
-
-@app.on_event("shutdown")
-def _shutdown():
-    hub.shutdown()
 
 
 @app.get("/")
