@@ -1,6 +1,6 @@
 # setup_host.ps1 -- provision a Windows machine to run reachy-twin.
 # Usage (from the repo root):  powershell -ExecutionPolicy Bypass -File .\setup_host.ps1
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 Write-Host "== reachy-twin host setup ==" -ForegroundColor Cyan
 
