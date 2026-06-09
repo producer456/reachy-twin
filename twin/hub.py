@@ -68,7 +68,8 @@ class RobotHub:
         self._last_face = 0.0
         self._cached_mode = "?"    # /api/motors/status is slow (~2s) -> cache it
         self._mode_ts = 0.0
-        self._servo_cache = {"body_yaw": None, "antenna_left": None, "antenna_right": None}
+        self._servo_cache = {"body_yaw": None, "head_yaw": None, "head_pitch": None,
+                             "antenna_left": None, "antenna_right": None}
         self._cascade = None       # opencv face detector (lazy)
         self._pose = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "body": 0.0, "ant": 0.0}  # degrees
         # iPad-relayed camera frame (used when robot camera is unavailable, e.g. Windows host)
@@ -527,8 +528,11 @@ class RobotHub:
         if self._lock.acquire(timeout=0.2):
             try:
                 head, ant = self.mini.get_current_joint_positions()
+                m = np.asarray(self.mini.get_current_head_pose(), dtype=float)
                 self._servo_cache = {
                     "body_yaw": round(float(np.rad2deg(head[0])), 1),   # head[0] = body yaw
+                    "head_yaw": round(float(np.rad2deg(np.arctan2(m[1, 0], m[0, 0]))), 1),
+                    "head_pitch": round(float(np.rad2deg(-np.arcsin(max(-1.0, min(1.0, m[2, 0]))))), 1),
                     "antenna_left": round(float(np.rad2deg(ant[0])), 1),
                     "antenna_right": round(float(np.rad2deg(ant[1])), 1),
                 }
@@ -547,6 +551,13 @@ class RobotHub:
             self._mode_ts = now
         out["mode"] = self._cached_mode
         return out
+
+    def look(self, yaw_deg, pitch_deg):
+        """Aim the head at an absolute yaw/pitch -- used by the iPad app's Vision
+        face-tracking. Routed through _pose so look, jog, and center share one state."""
+        self._pose["yaw"] = max(-self._JOG_LIMITS["yaw"], min(self._JOG_LIMITS["yaw"], float(yaw_deg)))
+        self._pose["pitch"] = max(-self._JOG_LIMITS["pitch"], min(self._JOG_LIMITS["pitch"], float(pitch_deg)))
+        return self._apply_pose()
 
     def jog(self, part, delta):
         if part in self._pose:

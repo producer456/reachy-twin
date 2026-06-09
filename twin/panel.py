@@ -84,6 +84,11 @@ class JogReq(BaseModel):
     delta: float    # degrees
 
 
+class LookReq(BaseModel):
+    yaw_deg: float      # + left (robot's frame), absolute
+    pitch_deg: float    # + down, absolute
+
+
 @app.get("/")
 def index():
     return FileResponse(STATIC / "index.html")
@@ -161,6 +166,11 @@ def ipad_snapshot():
 @app.post("/api/jog")
 def post_jog(r: JogReq):
     return {"pose": hub.jog(r.part, r.delta)}
+
+
+@app.post("/api/look")
+def post_look(r: LookReq):
+    return {"pose": hub.look(r.yaw_deg, r.pitch_deg)}
 
 
 @app.post("/api/center")
