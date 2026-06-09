@@ -1,9 +1,25 @@
 # ReachyPad — native iPad controller for Reachy Mini  (resume keyword: REACHYPAD)
 
 Pivot from the Windows web panel to a **native iPadOS app**. The Windows build
-(this repo's `twin/` hub + panel) stays as-is — we come back to it later. iPad work
-happens in **Xcode on the Mac** (`davids-macbook-pro`, reachable via Tailscale SSH,
-key `id_ed25519_mac`).
+(this repo's `twin/` hub + panel) stays as-is — we come back to it later.
+
+## ⭐ START HERE (Mac session)
+**Host moved to the Mac**: Reachy plugs into the Mac, daemon + hub run on macOS, the iPad app
+is developed in the **iOS Simulator** (talks to the hub at `http://localhost:8500`). Do this:
+1. `cd reachy-twin && bash setup_host.sh`  — installs the stack + Kokoro/Piper models, makes `.env`.
+2. Edit `.env`: `MARCUS_URL=http://100.67.2.40:7860` (vr-2 over Tailscale); leave `ANTHROPIC_API_KEY`
+   blank (Claude runs FREE via the Mac's Claude-CLI subscription).
+3. Plug Reachy in (USB-C + the **7V-5A** motor supply). `./.venv/bin/reachy-mini-daemon` →
+   confirm all 9 motors, then `./.venv/bin/python step0_alive.py` to see him move.
+4. `./.venv/bin/python -m twin.panel` → verify `http://localhost:8500/api/state`.
+   (Also test if the **robot camera works on macOS** here — `python probe stuff` / get_frame; it was
+   dead on Windows. If it works on Mac, robot-POV face-track becomes possible too.)
+5. Scaffold the Xcode SwiftUI app "**ReachyPad**" (iPad, iPadOS 17, landscape), run in the Simulator,
+   point it at `http://localhost:8500`. Build order in the section below.
+6. Add `POST /api/look {yaw_deg,pitch_deg}` to `twin/hub.py`; for face-track dev, the Simulator can
+   use the Mac's webcam for Vision face detection.
+
+Mac SSH (if driving it remotely): see memory [[project_mac_ssh]] — admin@100.110.228.25, key id_ed25519_mac.
 
 ## Target
 - **iPad Pro 10.5" (2017, A10X), iPadOS 17** (its max). Lightning. SwiftUI.
@@ -13,7 +29,7 @@ key `id_ed25519_mac`).
 ## Architecture (decided)
 The Lite is a USB robot → it **needs a host computer running the daemon** (motors/camera/
 audio over USB). The iPad can't be that host. So:
-- **Host (Windows laptop now, or vr-2/Pi later):** keeps the daemon **+ our Python `hub`**
+- **Host = the Mac now** (Reachy plugs into it; vr-2/Pi later): keeps the daemon **+ our Python `hub`**
   (`python -m twin.panel`, http://HOST:8500). The voice loop (robot mic → Whisper → brain →
   Kokoro TTS → robot speaker) and both brains stay HOST-side. Claude stays FREE via the
   host's Claude CLI (no API key). User chose **robot mic+speaker** for voice.
