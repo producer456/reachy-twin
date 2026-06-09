@@ -6,6 +6,7 @@ can slip in between chunks, hold the lock for its playback, and the capture loop
 pauses until he's done talking. Brain calls (Claude CLI / Marcus HTTP) are not locked.
 """
 import json
+import os
 import re
 import threading
 import time
@@ -78,7 +79,10 @@ class RobotHub:
 
     # ---------- lifecycle ----------
     def start(self):
-        self.mini = ReachyMini(media_backend="default")
+        # On Windows the LOCAL/GStreamer-IPC camera path is broken, so let the env
+        # force webrtc (cross-platform). Default behavior unchanged for Linux/macOS.
+        backend = os.environ.get("REACHY_MEDIA_BACKEND", "default")
+        self.mini = ReachyMini(media_backend=backend)
         self.mini.__enter__()
         self.mini.media.start_recording()
         self.mini.media.start_playing()
