@@ -209,10 +209,12 @@ function showMoves(tab){
 }
 async function playMove(kind,name){ try{ await api('/api/move',{kind,name}); }catch(e){} }
 async function toggleBh(name){ try{ const s=await api('/api/state'); await api('/api/behavior',{name,on:!s.behaviors[name]}); refresh(); }catch(e){} }
+let camTimer=null;
 function toggleCam(){
   const img=$('cam');
-  if(img.style.display!=='block'){ img.src='/api/camera?'+Date.now(); img.style.display='block'; $('camBtn').textContent='Hide camera'; }
-  else { img.src=''; img.style.display='none'; $('camBtn').textContent='Show camera'; }
+  if(camTimer){ clearInterval(camTimer); camTimer=null; img.style.display='none'; img.removeAttribute('src'); $('camBtn').textContent='Show camera'; return; }
+  img.style.display='block'; $('camBtn').textContent='Hide camera';
+  camTimer=setInterval(()=>{ img.src='/api/snapshot?t='+Date.now(); }, 250);
 }
 async function jog(part,delta){ try{ await api('/api/jog',{part,delta}); }catch(e){} }
 async function center(){ try{ await api('/api/center',{x:1}); }catch(e){} }

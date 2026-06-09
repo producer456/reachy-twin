@@ -48,6 +48,13 @@ class RobotHub:
         self._body_yaw = 0.0
         self._last_doa_turn = 0.0
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
+        # neck-comfort (body follows a sustained head turn)
+        self._head_yaw = 0.0
+        self._comfort_since = None
+        self._comfort_engaged = False
+        self._last_comfort = 0.0
+        self._vol_cache = None     # cache slow /api/volume/current
+        self._vol_ts = 0.0
         self._last_face = 0.0
         self._cached_mode = "?"    # /api/motors/status is slow (~2s) -> cache it
         self._mode_ts = 0.0
@@ -247,6 +254,7 @@ class RobotHub:
                 self._face_track_tick()
             if self.behaviors["turn_to_sound"]:
                 self._turn_to_sound_tick()
+            self._comfort_tick()        # always-on postural layer: body follows a held head turn
             time.sleep(0.06)
 
     HEAD_LOOK_MAX = 0.6   # rad (~34 deg) the head will glance before the body helps
@@ -277,7 +285,65 @@ class RobotHub:
         with self._lock:
             self.mini.goto_target(head=head, body_yaw=target_body, duration=0.4)
         self._body_yaw = target_body
+        self._head_yaw = head_yaw
         self._last_doa_turn = now
+
+    # neck-comfort tuning
+    COMFORT_DEG = 14       # head held past this (deg) -> body starts to follow
+    LEAD_DEG = 5           # residual head lead left after settling (looks alive)
+    COMFORT_STEP_DEG = 6   # body catch-up per step
+    COMFORT_DWELL = 1.2    # seconds the head must stay off-center before the body commits
+
+    def _head_yaw_now(self):
+        try:
+            with self._lock:
+                m = np.asarray(self.mini.get_current_head_pose(), dtype=float)
+            return float(np.arctan2(m[1, 0], m[0, 0]))
+        except Exception:
+            return None
+
+    def _comfort_tick(self):
+        now = time.time()
+        if now - self._last_comfort < 0.3:
+            return
+        self._last_comfort = now
+        hy = self._head_yaw_now()
+        if hy is None:
+            return
+        hy_deg = float(np.rad2deg(hy))
+        if abs(hy_deg) <= self.LEAD_DEG + 1:            # already comfortable -> done
+            self._comfort_since = None
+            self._comfort_engaged = False
+            return
+        if not self._comfort_engaged:
+            if abs(hy_deg) < self.COMFORT_DEG:          # small glance -> leave it
+                self._comfort_since = None
+                return
+            if self._comfort_since is None:             # start the dwell timer
+                self._comfort_since = now
+                return
+            if now - self._comfort_since < self.COMFORT_DWELL:
+                return
+            self._comfort_engaged = True                # sustained -> commit to squaring up
+        # transfer a step from head to body, preserving gaze, leaving a small head lead
+        sign = 1.0 if hy_deg > 0 else -1.0
+        excess = abs(hy_deg) - self.LEAD_DEG
+        step_deg = sign * min(self.COMFORT_STEP_DEG, excess)
+        new_body = max(-2.7, min(2.7, self._body_yaw + np.deg2rad(step_deg)))
+        actual = new_body - self._body_yaw
+        if abs(actual) < 1e-4:                          # body at its limit -> head holds
+            return
+        if self.behaviors.get("face_track"):
+            with self._lock:                            # camera re-centers the head; just turn body
+                self.mini.goto_target(body_yaw=new_body, duration=0.5)
+        else:
+            from reachy_mini.utils import create_head_pose
+            new_head_yaw = hy - actual                  # counter-rotate head -> gaze unchanged
+            head = create_head_pose(yaw=float(np.rad2deg(new_head_yaw)), degrees=True)
+            with self._lock:
+                self.mini.goto_target(head=head, body_yaw=new_body, duration=0.5)
+            self._head_yaw = new_head_yaw
+        self._body_yaw = new_body
 
     def _detect_faces(self, frame):
         import os
@@ -340,11 +406,20 @@ class RobotHub:
             return None
 
     # ---------- camera + manual jog ----------
-    def get_jpeg(self, quality=70):
-        try:
-            frame = self.mini.media.get_frame()
-        except Exception:
-            return None
+    def get_jpeg(self, quality=70, timeout=0.5):
+        # bound get_frame() so a stalled/empty camera pipeline can't hang the request
+        result = [None]
+
+        def _grab():
+            try:
+                result[0] = self.mini.media.get_frame()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_grab, daemon=True)
+        t.start()
+        t.join(timeout)
+        frame = result[0]
         if frame is None:
             return None
         import cv2
@@ -432,6 +507,8 @@ class RobotHub:
         return True
 
     def set_volume(self, v):
+        self._vol_cache = int(v)            # reflect immediately in the panel
+        self._vol_ts = time.time()
         body = json.dumps({"volume": int(v)}).encode()
         req = urllib.request.Request(DAEMON + "/api/volume/set", data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
@@ -440,12 +517,19 @@ class RobotHub:
         except Exception as e:
             return {"error": str(e)}
 
+    def _volume_cached(self):
+        now = time.time()
+        if self._vol_cache is None or now - self._vol_ts > 3:
+            self._vol_cache = self.get_volume().get("volume")
+            self._vol_ts = now
+        return self._vol_cache
+
     # ---------- state for the panel ----------
     def state(self):
         return {
             "active": self.active,
             "listening": self._listening,
-            "volume": self.get_volume().get("volume"),
+            "volume": self._volume_cached(),
             "brains": list(self.brains),
             "voices": self.voices,
             "behaviors": self.behaviors,

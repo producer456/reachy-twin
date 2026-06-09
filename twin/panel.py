@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from twin.hub import RobotHub
@@ -118,15 +118,12 @@ def post_behavior(r: BehaviorReq):
     return {"behaviors": hub.set_behavior(r.name, r.on)}
 
 
-@app.get("/api/camera")
-def camera():
-    def gen():
-        while True:
-            jpg = hub.get_jpeg()
-            if jpg:
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            time.sleep(0.066)      # ~15 fps
-    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+@app.get("/api/snapshot")
+def snapshot():
+    jpg = hub.get_jpeg()
+    if not jpg:
+        return Response(status_code=204)     # no frame available
+    return Response(content=jpg, media_type="image/jpeg")
 
 
 @app.post("/api/jog")
