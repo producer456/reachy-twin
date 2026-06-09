@@ -1,0 +1,6 @@
+.venv/
+.env
+models/
+_ref_conversation_app/
+__pycache__/
+*.pyc
