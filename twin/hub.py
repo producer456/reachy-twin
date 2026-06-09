@@ -6,6 +6,7 @@ can slip in between chunks, hold the lock for its playback, and the capture loop
 pauses until he's done talking. Brain calls (Claude CLI / Marcus HTTP) are not locked.
 """
 import json
+import re
 import threading
 import time
 import urllib.request
@@ -73,22 +74,43 @@ class RobotHub:
 
     # ---------- speech ----------
     def say(self, text, voice=None):
+        self._say_with_motion(text, None, voice)
+
+    def _say_with_motion(self, text, move, voice=None):
+        """Speak while an (optional) emotion move plays concurrently -- like real body language.
+
+        push_audio_sample is non-blocking and the daemon composes its audio-reactive wobble
+        on top of the move's pose, so motion + speech layer instead of fighting.
+        """
         if not text:
             return
         voice = voice or self.voices.get(self.active, "af_heart")
         samples = self.tts.synth(text, voice=voice)
         dur = len(samples) / SR
         with self._lock:
-            self.mini.media.push_audio_sample(samples)
+            mt = None
+            if move is not None:
+                def _run():
+                    try:
+                        self.mini.play_move(move, sound=False)   # motion only; speech is the audio
+                    except Exception:
+                        pass
+                mt = threading.Thread(target=_run, daemon=True)
+                mt.start()
+            self.mini.media.push_audio_sample(samples)           # speech starts immediately
             t0 = time.time()
-            while time.time() - t0 < dur + 0.3:     # drain mic so we don't hear ourselves
+            while time.time() - t0 < dur + 0.3:                  # drain mic so we don't hear ourselves
                 self.mini.media.get_audio_sample()
+            if mt is not None:
+                mt.join(timeout=4)
 
     # ---------- chat ----------
     def chat(self, text, brain=None):
         text = (text or "").strip()
         if not text:
             return {"brain": self.active, "reply": ""}
+        if self._maybe_volume_command(text):
+            return {"brain": self.active, "reply": "[volume adjusted]", "command": "volume"}
         switched = detect_switch(text, self.active)
         if switched and switched in self.brains:
             self.active = switched
@@ -102,11 +124,12 @@ class RobotHub:
             reply = self.brains[self.active].reply(msg)
         mood, reply = strip_mood(reply)          # pull the brain's [mood] tag off the speech
         self._log(self.active, reply)
+        move = None
         if self.behaviors.get("emotions_on_cue"):
             emo = MOOD_TO_EMOTION.get(mood) if mood else self._emotion_for(reply)
             if emo:
-                self._play_emotion_motion(emo)
-        self.say(reply)
+                move = self._get_emotion_move(emo)
+        self._say_with_motion(reply, move)       # gesture + speech happen together
         return {"brain": self.active, "reply": reply, "mood": mood}
 
     def set_brain(self, brain):
@@ -266,14 +289,12 @@ class RobotHub:
             return "curious1"
         return None
 
-    def _play_emotion_motion(self, name):
+    def _get_emotion_move(self, name):
         try:
             self._load_moves()
-            move = self.emotions.get(name)
+            return self.emotions.get(name)
         except Exception:
-            return
-        with self._lock:
-            self.mini.play_move(move, sound=False)   # motion only -> no audio clash with speech
+            return None
 
     # ---------- volume (proxy daemon) ----------
     def get_volume(self):
@@ -281,6 +302,31 @@ class RobotHub:
             return json.loads(urllib.request.urlopen(DAEMON + "/api/volume/current", timeout=5).read())
         except Exception as e:
             return {"error": str(e)}
+
+    def _maybe_volume_command(self, text):
+        """Intercept spoken/typed volume commands. Returns True if handled (no brain call)."""
+        t = text.lower()
+        cur = self.get_volume().get("volume", 60) or 60
+        target = None
+        m = re.search(r"(?:volume|turn\s*(?:it\s*)?(?:up|down)?)\s*(?:to\s*)?(\d{1,3})", t)
+        if "mute" in t:
+            target = 0
+        elif "volume" in t and re.search(r"\b(max|full|loudest|all the way)\b", t):
+            target = 100
+        elif m:
+            target = int(m.group(1))
+        elif re.search(r"\b(quieter|too loud|turn it down|turn down|lower|softer|down a bit|less loud)\b", t):
+            target = cur - 15
+        elif re.search(r"\b(louder|speak up|turn it up|turn up|can'?t hear|volume up|more volume)\b", t):
+            target = cur + 15
+        if target is None:
+            return False
+        target = max(0, min(100, target))
+        self.set_volume(target)
+        self._log("you", text)
+        self._log("system", f"volume -> {target}")
+        self.say(f"Okay, volume {target}." if target else "Muted.")
+        return True
 
     def set_volume(self, v):
         body = json.dumps({"volume": int(v)}).encode()

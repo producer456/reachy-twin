@@ -16,6 +16,13 @@ import urllib.request
 from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MARCUS_URL
 
 
+def looks_like_tool_call(t: str) -> bool:
+    """Marcus sometimes streams a raw tool-call dict (e.g. {"tool":"searchMessages",...})
+    that his web UI would execute. We can't run his tools, so detect + replace it."""
+    s = (t or "").strip().lower()
+    return s.startswith("{") and "tool" in s and "arg" in s
+
+
 def clean_for_speech(t: str) -> str:
     """Strip Marcus's memory notes + markdown so the TTS doesn't read symbols aloud."""
     if "💾" in t:                       # drop trailing "_💾 Remembered: ..._" note
@@ -176,6 +183,8 @@ class MarcusBrain(_ChatBrain):
                         text = obj["text"]             # cumulative -> keep latest
         except Exception as e:
             text = f"I can't reach Marcus right now: {e}"
+        if looks_like_tool_call(text):
+            text = "That one needs me to dig through my memory, which I can't do from in here yet. Ask me something else?"
         text = clean_for_speech(text) or "Hm, I got nothing back."
         self._remember("assistant", text)
         return text
