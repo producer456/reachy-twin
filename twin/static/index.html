@@ -106,7 +106,10 @@
     </div>
     <div class="grp">
       <label>Camera &amp; Move</label>
-      <div class="row"><button id="camBtn" onclick="toggleCam()">Show camera</button></div>
+      <div class="row">
+        <button id="camBtn" onclick="toggleCam('/api/snapshot','camBtn','Show robot camera')">Show robot camera</button>
+        <button id="ipadCamBtn" onclick="toggleCam('/api/ipad_snapshot','ipadCamBtn','Show iPad camera')">Show iPad camera</button>
+      </div>
       <img id="cam" class="cam">
       <div class="jog">
         <button class="sp"></button>
@@ -209,12 +212,18 @@ function showMoves(tab){
 }
 async function playMove(kind,name){ try{ await api('/api/move',{kind,name}); }catch(e){} }
 async function toggleBh(name){ try{ const s=await api('/api/state'); await api('/api/behavior',{name,on:!s.behaviors[name]}); refresh(); }catch(e){} }
-let camTimer=null;
-function toggleCam(){
-  const img=$('cam');
-  if(camTimer){ clearInterval(camTimer); camTimer=null; img.style.display='none'; img.removeAttribute('src'); $('camBtn').textContent='Show camera'; return; }
-  img.style.display='block'; $('camBtn').textContent='Hide camera';
-  camTimer=setInterval(()=>{ img.src='/api/snapshot?t='+Date.now(); }, 250);
+let camTimer=null, camSource=null;
+function toggleCam(source, btnId, showLabel){
+  const img=$('cam'); const btn=$(btnId);
+  if(camTimer && camSource===source){
+    clearInterval(camTimer); camTimer=null; camSource=null;
+    img.style.display='none'; img.removeAttribute('src'); btn.textContent=showLabel; return;
+  }
+  if(camTimer){ clearInterval(camTimer); }
+  ['camBtn','ipadCamBtn'].forEach(id=>{ const b=$(id); if(b) b.textContent = id===btnId ? 'Hide camera' : (id==='camBtn'?'Show robot camera':'Show iPad camera'); });
+  camSource = source;
+  img.style.display='block';
+  camTimer=setInterval(()=>{ img.src=source+'?t='+Date.now(); }, 250);
 }
 async function jog(part,delta){ try{ await api('/api/jog',{part,delta}); }catch(e){} }
 async function center(){ try{ await api('/api/center',{x:1}); }catch(e){} }

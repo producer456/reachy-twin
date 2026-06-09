@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -124,6 +124,21 @@ def snapshot():
     jpg = hub.get_jpeg()
     if not jpg:
         return Response(status_code=204)     # no frame available
+    return Response(content=jpg, media_type="image/jpeg")
+
+
+@app.post("/api/ipad_frame")
+async def post_ipad_frame(request: Request):
+    body = await request.body()
+    hub.push_ipad_frame(body)
+    return {"ok": True, "bytes": len(body)}
+
+
+@app.get("/api/ipad_snapshot")
+def ipad_snapshot():
+    jpg = hub.get_ipad_jpeg()
+    if not jpg:
+        return Response(status_code=204)
     return Response(content=jpg, media_type="image/jpeg")
 
 

@@ -60,6 +60,21 @@ class RobotHub:
         self._mode_ts = 0.0
         self._cascade = None       # opencv face detector (lazy)
         self._pose = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "body": 0.0, "ant": 0.0}  # degrees
+        # iPad-relayed camera frame (used when robot camera is unavailable, e.g. Windows host)
+        self._ipad_jpeg = None
+        self._ipad_jpeg_ts = 0.0
+
+    def push_ipad_frame(self, jpeg_bytes):
+        if jpeg_bytes:
+            self._ipad_jpeg = jpeg_bytes
+            self._ipad_jpeg_ts = time.time()
+
+    def get_ipad_jpeg(self, max_age_sec=10.0):
+        if not self._ipad_jpeg:
+            return None
+        if time.time() - self._ipad_jpeg_ts > max_age_sec:
+            return None
+        return self._ipad_jpeg
 
     # ---------- lifecycle ----------
     def start(self):
