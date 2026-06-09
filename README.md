@@ -59,6 +59,20 @@ python -m twin.panel
 python -m twin.app
 ```
 
+## Running on a second host
+
+Reachy is portable — plug him into any machine that has the stack. To provision a new
+Windows host in one shot:
+
+```powershell
+git clone https://github.com/producer456hub/reachy-twin && cd reachy-twin
+powershell -ExecutionPolicy Bypass -File .\setup_host.ps1
+# then edit .env  (on the box where Marcus runs, set MARCUS_URL=http://localhost:7860)
+```
+
+Only `MARCUS_URL` differs per host: point it at Marcus over the network from a laptop,
+or at `localhost` on the machine that actually runs Marcus.
+
 ## Notes
 
 - The **Claude brain needs no API key** if you have Claude Code installed and logged in — it shells
