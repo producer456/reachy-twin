@@ -48,6 +48,9 @@ class RobotHub:
         self._body_yaw = 0.0
         self._last_doa_turn = 0.0
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
+        self._last_face = 0.0
+        self._cascade = None       # opencv face detector (lazy)
+        self._pose = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "body": 0.0, "ant": 0.0}  # degrees
 
     # ---------- lifecycle ----------
     def start(self):
@@ -268,8 +271,40 @@ class RobotHub:
         self._body_yaw = target
         self._last_doa_turn = now
 
+    def _detect_faces(self, frame):
+        import os
+        import cv2
+        if self._cascade is None:
+            self._cascade = cv2.CascadeClassifier(
+                os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return self._cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+
     def _face_track_tick(self):
-        return False                                 # implemented in CP3b (vision deps)
+        now = time.time()
+        if now - self._last_face < 0.25:             # ~4 Hz tracking
+            return False
+        self._last_face = now
+        try:
+            frame = self.mini.media.get_frame()
+        except Exception:
+            return False
+        if frame is None:
+            return False
+        faces = self._detect_faces(frame)
+        if len(faces) == 0:
+            return False
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])   # largest face
+        cx, cy = x + w // 2, y + h // 2
+        H, W = frame.shape[:2]
+        if abs(cx - W / 2) < W * 0.08 and abs(cy - H / 2) < H * 0.08:
+            return True                              # already centered -> hold
+        with self._lock:
+            try:
+                self.mini.look_at_image(int(cx), int(cy), duration=0.35, perform_movement=True)
+            except Exception:
+                pass
+        return True
 
     def _emotion_for(self, text):
         t = text.lower()
@@ -295,6 +330,40 @@ class RobotHub:
             return self.emotions.get(name)
         except Exception:
             return None
+
+    # ---------- camera + manual jog ----------
+    def get_jpeg(self, quality=70):
+        try:
+            frame = self.mini.media.get_frame()
+        except Exception:
+            return None
+        if frame is None:
+            return None
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        return buf.tobytes() if ok else None
+
+    _JOG_LIMITS = {"pitch": 30, "roll": 30, "yaw": 60, "body": 90, "ant": 90}  # degrees
+
+    def _apply_pose(self):
+        from reachy_mini.utils import create_head_pose
+        p = self._pose
+        head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
+        with self._lock:
+            self.mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
+                                  antennas=np.deg2rad([p["ant"], p["ant"]]), duration=0.35)
+        return dict(self._pose)
+
+    def jog(self, part, delta):
+        if part in self._pose:
+            lim = self._JOG_LIMITS[part]
+            self._pose[part] = max(-lim, min(lim, self._pose[part] + float(delta)))
+        return self._apply_pose()
+
+    def center(self):
+        for k in self._pose:
+            self._pose[k] = 0.0
+        return self._apply_pose()
 
     # ---------- volume (proxy daemon) ----------
     def get_volume(self):

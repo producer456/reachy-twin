@@ -30,8 +30,13 @@
   .msg.marcus{align-self:flex-start;background:#33121f;border:1px solid var(--marcus)}
   .msg.system{align-self:center;color:var(--dim);font-size:12px;background:none}
   .who{font-size:11px;text-transform:uppercase;letter-spacing:.6px;opacity:.7;margin-bottom:2px}
-  aside{width:230px;border-left:1px solid var(--line);background:var(--panel);padding:16px;display:flex;
-        flex-direction:column;gap:18px}
+  aside{width:240px;border-left:1px solid var(--line);background:var(--panel);padding:16px;display:flex;
+        flex-direction:column;gap:18px;overflow-y:auto}
+  .cam{width:100%;border-radius:8px;border:1px solid var(--line);margin-top:8px;display:none;background:#000}
+  .jog{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}
+  .jog button{padding:8px 0;font-size:13px}
+  .jog .sp{visibility:hidden}
+  .jog2{display:flex;gap:5px;margin-top:5px}
   .grp label{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim)}
   .row{display:flex;gap:8px;margin-top:8px}
   button{cursor:pointer;border:1px solid var(--line);background:#1c2138;color:var(--txt);
@@ -92,7 +97,29 @@
       <div class="behaviors">
         <button id="bhTurn" class="bh" onclick="toggleBh('turn_to_sound')">Turn to sound</button>
         <button id="bhEmo" class="bh" onclick="toggleBh('emotions_on_cue')">Emotions on cue</button>
-        <button id="bhFace" class="bh" onclick="toggleBh('face_track')" disabled>Face-track (soon)</button>
+        <button id="bhFace" class="bh" onclick="toggleBh('face_track')">Face-track</button>
+      </div>
+    </div>
+    <div class="grp">
+      <label>Camera &amp; Move</label>
+      <div class="row"><button id="camBtn" onclick="toggleCam()">Show camera</button></div>
+      <img id="cam" class="cam">
+      <div class="jog">
+        <button class="sp"></button>
+        <button onclick="jog('pitch',-10)">Head &uarr;</button>
+        <button class="sp"></button>
+        <button onclick="jog('yaw',10)">&larr;</button>
+        <button onclick="center()">Center</button>
+        <button onclick="jog('yaw',-10)">&rarr;</button>
+        <button class="sp"></button>
+        <button onclick="jog('pitch',10)">Head &darr;</button>
+        <button class="sp"></button>
+      </div>
+      <div class="jog2">
+        <button onclick="jog('body',15)">Body &larr;</button>
+        <button onclick="jog('body',-15)">Body &rarr;</button>
+        <button onclick="jog('ant',15)">Ant &uarr;</button>
+        <button onclick="jog('ant',-15)">Ant &darr;</button>
       </div>
     </div>
     <div class="grp" style="flex:1;min-height:0;display:flex;flex-direction:column">
@@ -146,6 +173,7 @@ async function refresh(){
     if(s.behaviors){
       $('bhTurn').className='bh'+(s.behaviors.turn_to_sound?' on':'');
       $('bhEmo').className='bh'+(s.behaviors.emotions_on_cue?' on':'');
+      $('bhFace').className='bh'+(s.behaviors.face_track?' on':'');
     }
     renderLog(s.log);
   }catch(e){}
@@ -172,6 +200,13 @@ function showMoves(tab){
 }
 async function playMove(kind,name){ try{ await api('/api/move',{kind,name}); }catch(e){} }
 async function toggleBh(name){ try{ const s=await api('/api/state'); await api('/api/behavior',{name,on:!s.behaviors[name]}); refresh(); }catch(e){} }
+function toggleCam(){
+  const img=$('cam');
+  if(img.style.display!=='block'){ img.src='/api/camera?'+Date.now(); img.style.display='block'; $('camBtn').textContent='Hide camera'; }
+  else { img.src=''; img.style.display='none'; $('camBtn').textContent='Show camera'; }
+}
+async function jog(part,delta){ try{ await api('/api/jog',{part,delta}); }catch(e){} }
+async function center(){ try{ await api('/api/center',{x:1}); }catch(e){} }
 setInterval(refresh,1500); refresh(); loadMoves();
 </script>
 </body>

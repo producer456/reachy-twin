@@ -4,12 +4,13 @@ Run with the daemon already running:
     python -m twin.panel
 Then open http://127.0.0.1:8500
 """
+import time
 from pathlib import Path
 from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from twin.hub import RobotHub
@@ -49,6 +50,11 @@ class MoveReq(BaseModel):
 class BehaviorReq(BaseModel):
     name: str       # turn_to_sound | face_track | emotions_on_cue
     on: bool
+
+
+class JogReq(BaseModel):
+    part: str       # pitch | roll | yaw | body | ant
+    delta: float    # degrees
 
 
 @app.on_event("startup")
@@ -110,6 +116,27 @@ def post_move(r: MoveReq):
 @app.post("/api/behavior")
 def post_behavior(r: BehaviorReq):
     return {"behaviors": hub.set_behavior(r.name, r.on)}
+
+
+@app.get("/api/camera")
+def camera():
+    def gen():
+        while True:
+            jpg = hub.get_jpeg()
+            if jpg:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            time.sleep(0.066)      # ~15 fps
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.post("/api/jog")
+def post_jog(r: JogReq):
+    return {"pose": hub.jog(r.part, r.delta)}
+
+
+@app.post("/api/center")
+def post_center():
+    return {"pose": hub.center()}
 
 
 def main():
