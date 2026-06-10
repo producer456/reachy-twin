@@ -199,6 +199,8 @@ class RobotHub:
     def _supervise(self):
         connect_fails = 0
         link_fails = 0
+        cam_fails = 0
+        cam_ok_once = False   # only treat a dead camera as fatal if it worked this session
         while not self._supervisor_stop.is_set():
             self._supervisor_stop.wait(self.SUPERVISE_PERIOD)
             if self._supervisor_stop.is_set():
@@ -229,6 +231,20 @@ class RobotHub:
                 self._log("system", "robot link stale -- reconnecting")
                 link_fails = 0
                 self._teardown_mini()
+                continue
+            # camera liveness: motors can survive a replug while the daemon's
+            # video pipeline silently dies bound to the old USB device
+            jpg = self.get_jpeg(quality=40)
+            if jpg:
+                cam_ok_once = True
+                cam_fails = 0
+            elif cam_ok_once:
+                cam_fails += 1
+                if cam_fails >= 4:              # ~20s of no frames after having worked
+                    cam_fails = 0
+                    self._log("system", "camera stream died -- restarting daemon")
+                    if self._kick_daemon():
+                        self._teardown_mini()   # rebuild our client against the new daemon
 
     def reconnect(self):
         """Client-requested: force-reestablish the robot link right now."""
