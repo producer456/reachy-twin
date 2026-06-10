@@ -70,6 +70,7 @@ class RobotHub:
         self._vol_ts = 0.0
         self._vol_refreshing = False
         self._last_face = 0.0
+        self._face_seen_ts = 0.0   # last time a face was actually detected
         self._cached_mode = "?"    # /api/motors/status is slow (~2s) -> cache it
         self._mode_ts = 0.0
         self._servo_cache = {"body_yaw": None, "head_yaw": None, "head_pitch": None,
@@ -122,6 +123,10 @@ class RobotHub:
         except Exception as e:
             self._log("system", f"moves library unavailable: {e}")
         self._log("system", f"online - brains: {', '.join(self.brains)} | gate {self._thresh:.4f}")
+        # always-on by default: ears find him a face, eyes hold it, moods get acted out
+        self.set_behavior("face_track", True)
+        self.set_behavior("turn_to_sound", True)
+        self.set_behavior("emotions_on_cue", True)
 
     def shutdown(self):
         self._supervisor_stop.set()
@@ -340,11 +345,14 @@ class RobotHub:
                     finally:
                         self._lock.release()
                 time.sleep(0.18)
-            if self._lock.acquire(timeout=1.0):         # settle back to rest
-                try:
-                    self.mini.goto_target(antennas=np.deg2rad([base, base]), duration=0.4)
-                finally:
-                    self._lock.release()
+            for _ in range(10):                          # settle back -- retry through lock contention
+                if self._lock.acquire(timeout=1.0):
+                    try:
+                        self.mini.goto_target(antennas=np.deg2rad([base, base]), duration=0.4)
+                        break
+                    finally:
+                        self._lock.release()
+                time.sleep(0.3)
         except Exception:
             pass
 
@@ -491,12 +499,18 @@ class RobotHub:
             self._behavior_stop.set()
         return self.behaviors
 
+    FACE_HOLDS_GAZE_S = 2.5   # eyes own the head this long after seeing a face
+
     def _behavior_loop(self):
         while not self._behavior_stop.is_set() and (
                 self.behaviors["turn_to_sound"] or self.behaviors["face_track"]):
             if self.behaviors["face_track"]:
                 self._face_track_tick()
-            if self.behaviors["turn_to_sound"]:
+            # ears find, eyes hold: sound only steers when no face is in view,
+            # so a noise can't yank his gaze off the person he's looking at.
+            if self.behaviors["turn_to_sound"] and (
+                    not self.behaviors["face_track"]
+                    or time.time() - self._face_seen_ts > self.FACE_HOLDS_GAZE_S):
                 self._gaze_tick()
             self._follow_tick()         # always-on postural layer: body follows a held head turn
             time.sleep(0.06)
@@ -619,6 +633,7 @@ class RobotHub:
         faces = self._detect_faces(frame)
         if len(faces) == 0:
             return False
+        self._face_seen_ts = now                             # eyes have a target
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])   # largest face
         cx, cy = x + w // 2, y + h // 2
         H, W = frame.shape[:2]
