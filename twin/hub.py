@@ -11,10 +11,13 @@ worker thread synthesizes + plays in order, so HTTP callers never wait out the a
 The hub may start with no robot attached (panel retries in the background); every
 method that touches self.mini degrades gracefully until the daemon connects.
 """
+import glob
 import json
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -79,6 +82,10 @@ class RobotHub:
         self._speech_q = queue.Queue()
         self._speech_thread = threading.Thread(target=self._speech_worker, daemon=True)
         self._speech_thread.start()
+        # supervisor (auto-reconnect across robot replugs / daemon restarts)
+        self._supervisor_thread = None
+        self._supervisor_stop = threading.Event()
+        self._last_kick = 0.0
 
     def push_ipad_frame(self, jpeg_bytes):
         if jpeg_bytes:
@@ -115,18 +122,120 @@ class RobotHub:
         self._log("system", f"online - brains: {', '.join(self.brains)} | gate {self._thresh:.4f}")
 
     def shutdown(self):
+        self._supervisor_stop.set()
         self._behavior_stop.set()
         self.set_listening(False)
-        try:
-            self.mini.media.stop_recording()
-            self.mini.media.stop_playing()
-            self.mini.__exit__(None, None, None)
-        except Exception:
-            pass
+        self._teardown_mini()
 
     @property
     def robot_connected(self):
         return self.mini is not None
+
+    def _teardown_mini(self):
+        mini, self.mini = self.mini, None
+        if mini is None:
+            return
+        try:
+            mini.media.stop_recording()
+            mini.media.stop_playing()
+            mini.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    # ---------- supervision (auto-reconnect) ----------
+    # Owns the robot link end to end: initial connect, reconnect after the robot
+    # is replugged, and bouncing a "robot-less" daemon (one that started while
+    # the robot was unplugged -- it serves HTTP but has no motors, and SDK
+    # clients can't attach to it).
+    SUPERVISE_PERIOD = 5.0
+    KICK_COOLDOWN = 60.0
+
+    def start_supervisor(self):
+        if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
+            self._supervisor_stop.clear()
+            self._supervisor_thread = threading.Thread(target=self._supervise, daemon=True)
+            self._supervisor_thread.start()
+
+    def stop_supervisor(self):
+        self._supervisor_stop.set()
+
+    def _daemon_alive(self):
+        try:
+            urllib.request.urlopen(DAEMON + "/api/daemon/status", timeout=2)
+            return True
+        except Exception:
+            return False
+
+    def _serial_present(self):
+        if sys.platform == "darwin":
+            return bool(glob.glob("/dev/cu.usbmodem*"))
+        return True   # elsewhere, don't gate on it
+
+    def _kick_daemon(self, force=False):
+        """Restart the daemon's launchd service (macOS host only)."""
+        now = time.time()
+        if not force and now - self._last_kick < self.KICK_COOLDOWN:
+            return False
+        if sys.platform != "darwin":
+            return False
+        self._last_kick = now
+        self._log("system", "daemon has no robot -- restarting it")
+        try:
+            subprocess.run(["launchctl", "kickstart", "-k",
+                            f"gui/{os.getuid()}/com.legionstage.reachy-daemon"],
+                           timeout=10, capture_output=True)
+            return True
+        except Exception as e:
+            self._log("system", f"daemon restart failed: {e}")
+            return False
+
+    def _supervise(self):
+        connect_fails = 0
+        link_fails = 0
+        while not self._supervisor_stop.is_set():
+            self._supervisor_stop.wait(self.SUPERVISE_PERIOD)
+            if self._supervisor_stop.is_set():
+                break
+            if self.mini is None:
+                try:
+                    self.start()
+                    connect_fails = 0
+                except Exception as e:
+                    self.last_error = str(e)
+                    connect_fails += 1
+                    # daemon serving + robot USB present, yet clients can't attach
+                    # -> the daemon started while the robot was away; bounce it
+                    if connect_fails >= 2 and self._serial_present() and self._daemon_alive():
+                        self._kick_daemon()
+                continue
+            # link liveness: cheap joint read; skip the check while he's speaking
+            if not self._lock.acquire(timeout=1.5):
+                continue
+            try:
+                self.mini.get_current_joint_positions()
+                link_fails = 0
+            except Exception:
+                link_fails += 1
+            finally:
+                self._lock.release()
+            if link_fails >= 2:                 # two strikes -> rebuild the link
+                self._log("system", "robot link stale -- reconnecting")
+                link_fails = 0
+                self._teardown_mini()
+
+    def reconnect(self):
+        """Client-requested: force-reestablish the robot link right now."""
+        self._teardown_mini()
+        try:
+            self.start()
+            return {"ok": True, "robot": "connected"}
+        except Exception as e:
+            self.last_error = str(e)
+            if self._serial_present() and self._daemon_alive() and self._kick_daemon(force=True):
+                note = "daemon restarting -- auto-reconnect will finish in ~30s"
+            else:
+                note = str(e)
+            return {"ok": False, "robot": "disconnected", "note": note}
 
     # ---------- logging ----------
     def _log(self, who, text):
