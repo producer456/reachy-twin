@@ -37,6 +37,11 @@ from twin.brains import strip_mood, MOOD_TO_EMOTION
 
 DAEMON = "http://localhost:8000"
 BODY_YAW_MAX = 2.7   # rad, mechanical-ish limit used everywhere we command the body
+GESTURE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gestures")
+
+# inline action tags the LLM brain may emit ([dance], [gesture:hi], [look:left], ...)
+ACTION_RX = re.compile(r"\[(dance|gesture|look)(?::([a-zA-Z0-9_ \-]+))?\]", re.I)
+LOOK_PRESETS = {"left": (28, 0), "right": (-28, 0), "up": (0, -15), "down": (0, 18), "center": (0, 0)}
 
 
 class RobotHub:
@@ -89,6 +94,8 @@ class RobotHub:
         self._supervisor_stop = threading.Event()
         self._last_kick = 0.0
         self._thinking = threading.Event()   # set while a brain works; drives antenna flutter
+        self._recording_gesture = False      # behaviors pause while limp for hand-guiding
+        os.makedirs(GESTURE_DIR, exist_ok=True)
 
     def push_ipad_frame(self, jpeg_bytes):
         if jpeg_bytes:
@@ -123,6 +130,9 @@ class RobotHub:
         except Exception as e:
             self._log("system", f"moves library unavailable: {e}")
         self._log("system", f"online - brains: {', '.join(self.brains)} | gate {self._thresh:.4f}")
+        # tell the Claude brain what physical actions it can call
+        from twin import brains as _brains
+        _brains.set_actions_hint(self._dances or [], self.list_gestures())
         # always-on by default: ears find him a face, eyes hold it, moods get acted out
         self.set_behavior("face_track", True)
         self.set_behavior("turn_to_sound", True)
@@ -276,11 +286,20 @@ class RobotHub:
             return
         self._speech_q.put((text, move, voice or self.voices.get(self.active, "af_heart")))
 
+    def _enqueue_move(self, move):
+        """Queue a motion-only item (plays after any queued speech finishes)."""
+        if move is not None and self.mini is not None:
+            self._speech_q.put((None, move, None))
+
     def _speech_worker(self):
         while True:
             text, move, voice = self._speech_q.get()
             try:
-                self._speak_now(text, move, voice)
+                if text:
+                    self._speak_now(text, move, voice)
+                elif move is not None:
+                    with self._lock:
+                        self.mini.play_move(move)
             except Exception as e:
                 self._log("system", f"speech error: {e}")
 
@@ -394,6 +413,7 @@ class RobotHub:
         finally:
             self._thinking.clear()               # stop the flutter; time to talk
         mood, reply = strip_mood(reply)          # pull the brain's [mood] tag off the speech
+        actions, reply = self._extract_actions(reply)
         self._log(self.active, reply)
         move = None
         if self.behaviors.get("emotions_on_cue"):
@@ -401,7 +421,9 @@ class RobotHub:
             if emo:
                 move = self._get_emotion_move(emo)
         self._enqueue_say(reply, move)           # speech is async; reply returns immediately
-        return {"brain": self.active, "reply": reply, "mood": mood}
+        self._run_actions(actions)               # looks happen now; dances/gestures queue after speech
+        return {"brain": self.active, "reply": reply, "mood": mood,
+                "actions": [f"{k}:{v}" if v else k for k, v in actions] or None}
 
     def set_brain(self, brain):
         if brain in self.brains:
@@ -520,6 +542,9 @@ class RobotHub:
     def _behavior_loop(self):
         while not self._behavior_stop.is_set() and (
                 self.behaviors["turn_to_sound"] or self.behaviors["face_track"]):
+            if self._recording_gesture:          # hands-off while being hand-guided
+                time.sleep(0.2)
+                continue
             if self.behaviors["face_track"]:
                 self._face_track_tick()
             # ears find, eyes hold: sound only steers when no face is in view,
@@ -713,6 +738,108 @@ class RobotHub:
             return self.emotions.get(name)
         except Exception:
             return None
+
+    # ---------- LLM action tags ----------
+    @staticmethod
+    def _extract_actions(text):
+        """Pull [dance]/[gesture:NAME]/[look:DIR] tags out of a reply.
+        Returns (actions, clean_text) where actions is [(kind, arg|None), ...]."""
+        actions = [(m.group(1).lower(), (m.group(2) or "").strip().lower() or None)
+                   for m in ACTION_RX.finditer(text or "")]
+        clean = re.sub(r"\s{2,}", " ", ACTION_RX.sub("", text or "")).strip()
+        return actions, clean
+
+    def _run_actions(self, actions):
+        for kind, arg in actions[:2]:            # at most two actions per reply
+            try:
+                if kind == "look":
+                    yaw, pitch = LOOK_PRESETS.get(arg or "center", (0, 0))
+                    threading.Thread(target=self.look, args=(yaw, pitch), daemon=True).start()
+                elif kind == "gesture":
+                    self._enqueue_move(self._load_gesture(arg)) if arg else None
+                elif kind == "dance":
+                    self._load_moves()
+                    from reachy_mini_dances_library import DanceMove
+                    name = arg if arg in (self._dances or []) else random.choice(self._dances)
+                    self._enqueue_move(DanceMove(name))
+            except Exception as e:
+                self._log("system", f"action {kind}:{arg} failed: {e}")
+
+    # ---------- learned gestures (hand-guided record + replay) ----------
+    @staticmethod
+    def _gesture_path(name):
+        slug = re.sub(r"[^a-z0-9_\-]", "_", (name or "").strip().lower())[:40]
+        return (os.path.join(GESTURE_DIR, slug + ".json"), slug) if slug else (None, None)
+
+    def list_gestures(self):
+        try:
+            return sorted(f[:-5] for f in os.listdir(GESTURE_DIR) if f.endswith(".json"))
+        except Exception:
+            return []
+
+    def _load_gesture(self, name):
+        from reachy_mini.motion.recorded_move import RecordedMove
+        path, _ = self._gesture_path(name)
+        if not path or not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return RecordedMove(json.load(f))
+
+    def gesture_record_start(self):
+        if self.mini is None:
+            return {"error": "robot not connected"}
+        if self._recording_gesture:
+            return {"error": "already recording"}
+        self._recording_gesture = True           # behaviors + flutter stand down
+        with self._lock:
+            self.mini.disable_motors()           # limp -> move him by hand
+            self.mini.start_recording()
+        self._log("system", "gesture recording -- move him by hand")
+        return {"ok": True, "recording": True}
+
+    def gesture_record_stop(self, name, save=True):
+        if self.mini is None or not self._recording_gesture:
+            return {"error": "not recording"}
+        with self._lock:
+            data = self.mini.stop_recording()
+            self.mini.enable_motors()            # pins targets to present pose (no snap)
+        self._recording_gesture = False
+        if not save:
+            return {"ok": True, "discarded": True}
+        if not data:
+            return {"error": "nothing recorded"}
+        path, slug = self._gesture_path(name)
+        if not path:
+            return {"error": f"bad gesture name {name!r}"}
+        times = [float(r.get("time", i * 0.02)) for i, r in enumerate(data)]
+        t0 = times[0]
+        move = {"description": slug, "time": [t - t0 for t in times], "set_target_data": data}
+        with open(path, "w") as f:
+            json.dump(move, f)
+        self._log("system", f"learned gesture '{slug}' ({move['time'][-1]:.1f}s, {len(data)} frames)")
+        self._refresh_actions_hint()
+        return {"ok": True, "name": slug, "seconds": round(move["time"][-1], 1)}
+
+    def _refresh_actions_hint(self):
+        from twin import brains as _brains
+        _brains.set_actions_hint(self._dances or [], self.list_gestures())
+
+    def gesture_play(self, name):
+        if self.mini is None:
+            return {"error": "robot not connected"}
+        move = self._load_gesture(name)
+        if move is None:
+            return {"error": f"unknown gesture {name!r}"}
+        self._enqueue_move(move)
+        return {"ok": True, "name": name}
+
+    def gesture_delete(self, name):
+        path, slug = self._gesture_path(name)
+        if path and os.path.exists(path):
+            os.remove(path)
+            self._refresh_actions_hint()
+            return {"ok": True, "deleted": slug}
+        return {"error": f"unknown gesture {name!r}"}
 
     # ---------- camera + manual jog ----------
     def get_jpeg(self, quality=70, timeout=0.5):

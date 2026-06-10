@@ -74,6 +74,15 @@ class LookReq(BaseModel):
     pitch_deg: float    # + down, absolute
 
 
+class GestureReq(BaseModel):
+    name: str
+
+
+class GestureStopReq(BaseModel):
+    name: str
+    save: bool = True
+
+
 @app.get("/")
 def index():
     return FileResponse(STATIC / "index.html")
@@ -171,6 +180,31 @@ def get_servos():
 @app.post("/api/robot/reconnect")
 def post_reconnect():
     return hub.reconnect()
+
+
+@app.get("/api/gestures")
+def get_gestures():
+    return {"gestures": hub.list_gestures(), "recording": hub._recording_gesture}
+
+
+@app.post("/api/gesture/record/start")
+def post_gesture_start():
+    return hub.gesture_record_start()
+
+
+@app.post("/api/gesture/record/stop")
+def post_gesture_stop(r: GestureStopReq):
+    return hub.gesture_record_stop(r.name, save=r.save)
+
+
+@app.post("/api/gesture/play")
+def post_gesture_play(r: GestureReq):
+    return hub.gesture_play(r.name)
+
+
+@app.post("/api/gesture/delete")
+def post_gesture_delete(r: GestureReq):
+    return hub.gesture_delete(r.name)
 
 
 def main():

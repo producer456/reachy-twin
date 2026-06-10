@@ -50,7 +50,30 @@ SYSTEM_TMPL = (
     "Example: '[curious] Oh, what makes you say that?' "
     "OUTPUT RULES: after the tag, output ONLY the words you say aloud. Never narrate your reasoning "
     "or restate the request. The mood tag IS your body language; don't also describe physical actions."
+    "{actions}"
 )
+
+# Filled in by the hub once the robot's move libraries are loaded; tells the
+# brain which physical actions it may trigger with inline tags.
+_ACTIONS_HINT = ""
+
+
+def set_actions_hint(dances, gestures):
+    global _ACTIONS_HINT
+    dance_names = ", ".join(list(dances)[:20]) or "none loaded"
+    gesture_names = ", ".join(gestures) or "none taught yet"
+    _ACTIONS_HINT = (
+        " ACTIONS: you can also trigger REAL physical actions by including a tag anywhere in your "
+        "reply (it is removed before speaking): [dance] for a random dance, [dance:NAME] for a "
+        f"specific one (available: {dance_names}), [gesture:NAME] to perform a gesture your human "
+        f"taught you (available: {gesture_names}), [look:left] [look:right] [look:up] [look:down] "
+        "[look:center] to glance. Dances and gestures play after you finish speaking. Use at most "
+        "one or two, and only when it genuinely fits -- being asked to dance, celebrating, greeting."
+    )
+
+
+def get_actions_hint():
+    return _ACTIONS_HINT
 
 # Mood tag -> emotion move name (from pollen-robotics/reachy-mini-emotions-library)
 MOOD_TO_EMOTION = {
@@ -102,7 +125,7 @@ class ClaudeBrain(_ChatBrain):
         msg = self.client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=200,
-            system=SYSTEM_TMPL.format(name=self.name, other=self.other),
+            system=SYSTEM_TMPL.format(name=self.name, other=self.other, actions=get_actions_hint()),
             messages=self.history,
         )
         text = "".join(b.text for b in msg.content if b.type == "text").strip()
@@ -148,7 +171,7 @@ class ClaudeCLIBrain(_ChatBrain):
 
     def reply(self, user_text: str) -> str:
         self._remember("user", user_text)
-        system = SYSTEM_TMPL.format(name=self.name, other=self.other)
+        system = SYSTEM_TMPL.format(name=self.name, other=self.other, actions=get_actions_hint())
         common = ["--system-prompt", system, "--exclude-dynamic-system-prompt-sections"]
         reply = ""
         if self.session_id:
