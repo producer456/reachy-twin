@@ -545,13 +545,20 @@ class RobotHub:
 
     def _read_yaws(self):
         """Measured (body_yaw, head_yaw) in rad from the servos -- no dead reckoning."""
+        b, y, _ = self._read_pose()
+        return b, y
+
+    def _read_pose(self):
+        """Measured (body_yaw, head_yaw, head_pitch) in rad from the servos."""
         try:
             with self._lock:
                 head, _ = self.mini.get_current_joint_positions()
                 m = np.asarray(self.mini.get_current_head_pose(), dtype=float)
-            return float(head[0]), float(np.arctan2(m[1, 0], m[0, 0]))
+            yaw = float(np.arctan2(m[1, 0], m[0, 0]))
+            pitch = float(-np.arcsin(max(-1.0, min(1.0, m[2, 0]))))
+            return float(head[0]), yaw, pitch
         except Exception:
-            return None, None
+            return None, None, None
 
     def _gaze_tick(self):
         now = time.time()
@@ -635,6 +642,15 @@ class RobotHub:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return self._cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
 
+    # Bounded face tracking: we aim the head ourselves (instead of the SDK's
+    # unbounded look_at_image) so tracking can never command a pose where the
+    # head rim contacts the shell -- the bump zone is deep pitch at yaw.
+    FT_YAW_MAX_DEG = 38.0      # head-only; the follow layer brings the body for more
+    FT_PITCH_UP_DEG = -18.0    # looking up (negative = up); shell clearance limit
+    FT_PITCH_DOWN_DEG = 25.0   # looking down
+    FT_GAIN_YAW = 16.0         # deg of correction for a face at the frame edge
+    FT_GAIN_PITCH = 11.0
+
     def _face_track_tick(self):
         now = time.time()
         if now - self._last_face < 0.25:             # ~4 Hz tracking
@@ -655,9 +671,20 @@ class RobotHub:
         H, W = frame.shape[:2]
         if abs(cx - W / 2) < W * 0.08 and abs(cy - H / 2) < H * 0.08:
             return True                              # already centered -> hold
+        _, head_yaw, head_pitch = self._read_pose()
+        if head_yaw is None:
+            return False
+        dx = (cx - W / 2) / (W / 2)                  # -1..1, + = face right of center
+        dy = (cy - H / 2) / (H / 2)                  # + = face below center
+        new_yaw = max(-self.FT_YAW_MAX_DEG, min(self.FT_YAW_MAX_DEG,
+                      float(np.rad2deg(head_yaw)) - dx * self.FT_GAIN_YAW))
+        new_pitch = max(self.FT_PITCH_UP_DEG, min(self.FT_PITCH_DOWN_DEG,
+                        float(np.rad2deg(head_pitch)) + dy * self.FT_GAIN_PITCH))
+        from reachy_mini.utils import create_head_pose
+        pose = create_head_pose(yaw=new_yaw, pitch=new_pitch, degrees=True)
         with self._lock:
             try:
-                self.mini.look_at_image(int(cx), int(cy), duration=0.35, perform_movement=True)
+                self.mini.goto_target(head=pose, duration=0.3)
             except Exception:
                 pass
         return True
