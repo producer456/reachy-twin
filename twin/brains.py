@@ -19,9 +19,13 @@ from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MARCUS_URL
 
 def looks_like_tool_call(t: str) -> bool:
     """Marcus sometimes streams a raw tool-call dict (e.g. {"tool":"searchMessages",...})
-    that his web UI would execute. We can't run his tools, so detect + replace it."""
+    that his web UI would execute. We can't run his tools, so detect + replace it.
+    Streaming can clip the opening brace and curl the quotes, so match the shape
+    ('tool' key near the start + an args key) rather than requiring valid JSON."""
     s = (t or "").strip().lower()
-    return s.startswith("{") and "tool" in s and "arg" in s
+    if s.startswith("{") and "tool" in s and "arg" in s:
+        return True
+    return bool(re.match(r'^[\s{\'"“”]*tool[\'"“”\s]*[:=]', s)) and "arg" in s
 
 
 def clean_for_speech(t: str) -> str:

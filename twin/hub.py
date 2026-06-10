@@ -15,6 +15,7 @@ import glob
 import json
 import os
 import queue
+import random
 import re
 import subprocess
 import sys
@@ -261,14 +262,30 @@ class RobotHub:
             except Exception as e:
                 self._log("system", f"speech error: {e}")
 
+    @staticmethod
+    def _sentences(text, min_len=24):
+        """Split a reply into speakable chunks; merge fragments so chunks stay natural."""
+        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+        out = []
+        for p in parts:
+            if not p:
+                continue
+            if out and (len(out[-1]) < min_len or len(p) < 12):
+                out[-1] += " " + p
+            else:
+                out.append(p)
+        return out or [text]
+
     def _speak_now(self, text, move, voice):
         """Speak while an (optional) emotion move plays concurrently -- like real body language.
 
-        push_audio_sample is non-blocking and the daemon composes its audio-reactive wobble
-        on top of the move's pose, so motion + speech layer instead of fighting.
+        Synthesis is sentence-chunked: he starts talking after the FIRST sentence is
+        ready instead of waiting for the whole reply, and later sentences synthesize
+        while earlier ones play. push_audio_sample is non-blocking and the daemon
+        composes its audio-reactive wobble on top of the move's pose, so motion +
+        speech layer instead of fighting.
         """
-        samples = self.tts.synth(text, voice=voice)
-        dur = len(samples) / SR
+        chunks = self._sentences(text)
         with self._lock:
             mt = None
             if move is not None:
@@ -279,9 +296,13 @@ class RobotHub:
                         pass
                 mt = threading.Thread(target=_run, daemon=True)
                 mt.start()
-            self.mini.media.push_audio_sample(samples)           # speech starts immediately
+            total_dur = 0.0
             t0 = time.time()
-            while time.time() - t0 < dur + 0.3:                  # drain mic so we don't hear ourselves
+            for ch in chunks:
+                samples = self.tts.synth(ch, voice=voice)
+                self.mini.media.push_audio_sample(samples)       # queues; playback is continuous
+                total_dur += len(samples) / SR
+            while time.time() - t0 < total_dur + 0.3:            # drain mic so we don't hear ourselves
                 s = self.mini.media.get_audio_sample()
                 if s is None or len(s) == 0:
                     time.sleep(0.005)
@@ -289,7 +310,29 @@ class RobotHub:
                 mt.join(timeout=4)
 
     # ---------- chat ----------
-    def chat(self, text, brain=None):
+    THINK_FILLERS = ["Hmm.", "Hm, let me think.", "Mmm.", "Oh!", "Good question."]
+
+    def _think_cue(self, spoken):
+        """Instant acknowledgment while the brain works: antenna perk (always)
+        plus a short verbal filler when the input came in by voice."""
+        if self.mini is None:
+            return
+        if spoken:
+            self._enqueue_say(random.choice(self.THINK_FILLERS), None)
+
+        def _perk():
+            try:
+                base = self._pose["ant"] + self.ANT_REST_DEG
+                with self._lock:
+                    self.mini.goto_target(antennas=np.deg2rad([base + 22, base + 22]), duration=0.25)
+                time.sleep(0.35)
+                with self._lock:
+                    self.mini.goto_target(antennas=np.deg2rad([base, base]), duration=0.4)
+            except Exception:
+                pass
+        threading.Thread(target=_perk, daemon=True).start()
+
+    def chat(self, text, brain=None, spoken=False):
         text = (text or "").strip()
         if not text:
             return {"brain": self.active, "reply": ""}
@@ -302,6 +345,7 @@ class RobotHub:
             self.active = brain
         msg = strip_wake(text) if switched else text
         self._log("you", text)
+        self._think_cue(spoken)                  # he reacts NOW; the answer follows
         if not msg.strip():
             reply = f"{self.active.capitalize()} here. What's up?"
         else:
@@ -353,7 +397,7 @@ class RobotHub:
                 self._listening = False
                 self._stop.set()
                 break
-            self.chat(text)
+            self.chat(text, spoken=True)
 
     def _capture(self, max_seconds=15.0):
         buf, in_speech, run, silence = [], False, 0, 0
