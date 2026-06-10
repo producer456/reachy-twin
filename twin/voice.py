@@ -31,7 +31,9 @@ def calibrate_floor(mini, n=40):
         s = mini.media.get_audio_sample()
         if s is not None and len(s):
             vals.append(_rms(_mono(s)))
-    return max((float(np.median(vals)) if vals else 0.001) * 4.0, 0.012)
+    # clamp the ceiling too: calibrating while audio happens to be playing
+    # (e.g. a reconnect mid-speech) would otherwise leave the mic half-deaf
+    return min(max((float(np.median(vals)) if vals else 0.001) * 4.0, 0.012), 0.045)
 
 
 def detect_switch(text, current):

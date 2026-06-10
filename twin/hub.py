@@ -338,13 +338,15 @@ class RobotHub:
                 mt = threading.Thread(target=_run, daemon=True)
                 mt.start()
             total_dur = 0.0
-            t0 = time.time()
+            t0 = None                                            # playback starts at FIRST push
             for ch in chunks:
                 samples = self.tts.synth(ch, voice=voice)
                 self.mini.media.push_audio_sample(samples)       # queues; playback is continuous
+                if t0 is None:
+                    t0 = time.time()
                 total_dur += len(samples) / SR
-            while time.time() - t0 < total_dur + 0.3:            # drain mic so we don't hear ourselves
-                s = self.mini.media.get_audio_sample()
+            while t0 is not None and time.time() - t0 < total_dur + 0.3:
+                s = self.mini.media.get_audio_sample()           # drain mic so we don't hear ourselves
                 if s is None or len(s) == 0:
                     time.sleep(0.005)
             if mt is not None:
@@ -519,8 +521,11 @@ class RobotHub:
                 return {"error": f"unknown kind {kind!r}"}
         except Exception as e:
             return {"error": f"{name}: {e}"}
-        with self._lock:
-            self.mini.play_move(move)
+        try:
+            with self._lock:
+                self.mini.play_move(move)
+        except Exception as e:
+            return {"error": f"{name}: {e}"}
         self._log("system", f"played {kind}: {name}")
         return {"ok": True, "kind": kind, "name": name}
 
@@ -545,15 +550,24 @@ class RobotHub:
             if self._recording_gesture:          # hands-off while being hand-guided
                 time.sleep(0.2)
                 continue
-            if self.behaviors["face_track"]:
-                self._face_track_tick()
-            # ears find, eyes hold: sound only steers when no face is in view,
-            # so a noise can't yank his gaze off the person he's looking at.
-            if self.behaviors["turn_to_sound"] and (
-                    not self.behaviors["face_track"]
-                    or time.time() - self._face_seen_ts > self.FACE_HOLDS_GAZE_S):
-                self._gaze_tick()
-            self._follow_tick()         # always-on postural layer: body follows a held head turn
+            try:
+                if self.behaviors["face_track"]:
+                    self._face_track_tick()
+                # ears find, eyes hold: sound only steers when no face is in view,
+                # so a noise can't yank his gaze off the person he's looking at.
+                if self.behaviors["turn_to_sound"] and (
+                        not self.behaviors["face_track"]
+                        or time.time() - self._face_seen_ts > self.FACE_HOLDS_GAZE_S):
+                    self._gaze_tick()
+                self._follow_tick()     # always-on postural layer: body follows a held head turn
+            except Exception as e:
+                # an SDK hiccup (e.g. goto_target TimeoutError) must never kill
+                # this thread -- that silently disables every behavior until restart
+                now = time.time()
+                if now - getattr(self, "_last_behavior_err", 0) > 30:
+                    self._last_behavior_err = now
+                    self._log("system", f"behavior tick error (continuing): {e}")
+                time.sleep(0.5)
             time.sleep(0.06)
 
     # ---------- gaze controller ----------
@@ -815,7 +829,7 @@ class RobotHub:
         t0 = times[0]
         move = {"description": slug, "time": [t - t0 for t in times], "set_target_data": data}
         with open(path, "w") as f:
-            json.dump(move, f)
+            json.dump(move, f, default=float)    # tolerate stray numpy scalars
         self._log("system", f"learned gesture '{slug}' ({move['time'][-1]:.1f}s, {len(data)} frames)")
         self._refresh_actions_hint()
         return {"ok": True, "name": slug, "seconds": round(move["time"][-1], 1)}
