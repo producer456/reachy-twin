@@ -87,6 +87,7 @@ class RobotHub:
         self._supervisor_thread = None
         self._supervisor_stop = threading.Event()
         self._last_kick = 0.0
+        self._thinking = threading.Event()   # set while a brain works; drives antenna flutter
 
     def push_ipad_frame(self, jpeg_bytes):
         if jpeg_bytes:
@@ -313,24 +314,39 @@ class RobotHub:
     THINK_FILLERS = ["Hmm.", "Hm, let me think.", "Mmm.", "Oh!", "Good question."]
 
     def _think_cue(self, spoken):
-        """Instant acknowledgment while the brain works: antenna perk (always)
-        plus a short verbal filler when the input came in by voice."""
+        """Instant acknowledgment while the brain works: antennas perk up and
+        FLUTTER until the reply is ready (visible 'I'm on it'), plus a short
+        verbal filler when the input came in by voice."""
         if self.mini is None:
             return
         if spoken:
             self._enqueue_say(random.choice(self.THINK_FILLERS), None)
+        if not self._thinking.is_set():
+            self._thinking.set()
+            threading.Thread(target=self._antenna_flutter, daemon=True).start()
 
-        def _perk():
-            try:
-                base = self._pose["ant"] + self.ANT_REST_DEG
-                with self._lock:
-                    self.mini.goto_target(antennas=np.deg2rad([base + 22, base + 22]), duration=0.25)
-                time.sleep(0.35)
-                with self._lock:
+    def _antenna_flutter(self):
+        """Oscillate the antennas while `_thinking` is set, then settle back."""
+        try:
+            base = self._pose["ant"] + self.ANT_REST_DEG
+            t0 = time.time()
+            up = True
+            while self._thinking.is_set() and time.time() - t0 < 30:   # safety cap
+                a = base + (22 if up else 12)
+                up = not up
+                if self._lock.acquire(timeout=0.5):     # skip beats while he speaks
+                    try:
+                        self.mini.goto_target(antennas=np.deg2rad([a, a]), duration=0.15)
+                    finally:
+                        self._lock.release()
+                time.sleep(0.18)
+            if self._lock.acquire(timeout=1.0):         # settle back to rest
+                try:
                     self.mini.goto_target(antennas=np.deg2rad([base, base]), duration=0.4)
-            except Exception:
-                pass
-        threading.Thread(target=_perk, daemon=True).start()
+                finally:
+                    self._lock.release()
+        except Exception:
+            pass
 
     def chat(self, text, brain=None, spoken=False):
         text = (text or "").strip()
@@ -346,10 +362,13 @@ class RobotHub:
         msg = strip_wake(text) if switched else text
         self._log("you", text)
         self._think_cue(spoken)                  # he reacts NOW; the answer follows
-        if not msg.strip():
-            reply = f"{self.active.capitalize()} here. What's up?"
-        else:
-            reply = self.brains[self.active].reply(msg)
+        try:
+            if not msg.strip():
+                reply = f"{self.active.capitalize()} here. What's up?"
+            else:
+                reply = self.brains[self.active].reply(msg)
+        finally:
+            self._thinking.clear()               # stop the flutter; time to talk
         mood, reply = strip_mood(reply)          # pull the brain's [mood] tag off the speech
         self._log(self.active, reply)
         move = None
