@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <title>Reachy Twin Control</title>
 <style>
   :root{
@@ -49,7 +49,8 @@
   .grp label{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim)}
   .row{display:flex;gap:8px;margin-top:8px}
   button{cursor:pointer;border:1px solid var(--line);background:#1c2138;color:var(--txt);
-         padding:9px 12px;border-radius:9px;font-size:14px;flex:1;min-width:0;transition:.15s}
+         padding:9px 12px;border-radius:9px;font-size:14px;flex:1;min-width:0;transition:.15s;
+         touch-action:manipulation} /* no double-tap zoom-pan when tapping fast on iOS */
   button:hover{border-color:#3a4160}
   button.sel.claude{background:var(--claude);color:#022;border-color:var(--claude)}
   button.sel.marcus{background:var(--marcus);color:#201;border-color:var(--marcus)}
@@ -60,7 +61,7 @@
   .tabs button.on{background:#2a3150;border-color:var(--claude);color:var(--claude)}
   .chips{flex:1;overflow-y:auto;display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start;min-height:0}
   .chip{flex:0 0 auto;padding:6px 10px;font-size:12px;border:1px solid var(--line);border-radius:14px;
-        background:#1a1f33;cursor:pointer;transition:.12s}
+        background:#1a1f33;cursor:pointer;transition:.12s;touch-action:manipulation}
   .chip:hover{border-color:var(--marcus);color:var(--marcus)}
   .chip:active{transform:scale(.94)}
   .behaviors{display:flex;flex-direction:column;gap:6px;margin-top:8px}
@@ -76,8 +77,9 @@
     button{padding:11px 12px}
     .chip{padding:9px 12px;font-size:13px}
   }
-  /* very narrow (phone / iPad split view): stack the controls under the chat */
-  @media (max-width:700px){
+  /* phones only: stack the controls under the chat. Kept below iPad-with-Page-Zoom
+     widths (10.5" portrait at 125% zoom = 667px) so the iPad always stays two-pane. */
+  @media (max-width:540px){
     main{flex-direction:column}
     aside{width:100%;border-left:none;border-top:1px solid var(--line);max-height:48dvh}
   }
@@ -181,13 +183,17 @@ async function api(path,body){
 }
 function renderLog(log){
   if(log.length===lastLogLen) return; lastLogLen=log.length;
-  const el=$('log'); el.innerHTML='';
+  const el=$('log');
+  // only follow the tail if the user was already at the bottom -- a forced scroll
+  // mid-read (or while using the side menu) yanks the view back to the chat
+  const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  el.innerHTML='';
   for(const m of log){
     const d=document.createElement('div'); d.className='msg '+m.who;
     if(m.who!=='system'){const w=document.createElement('div');w.className='who';w.textContent=m.who;d.appendChild(w);}
     d.appendChild(document.createTextNode(m.text)); el.appendChild(d);
   }
-  el.scrollTop=el.scrollHeight;
+  if(pinned) el.scrollTop=el.scrollHeight;
 }
 function setActiveBadge(b){
   const el=$('activeBadge'); el.textContent=b; el.className='badge '+b;
