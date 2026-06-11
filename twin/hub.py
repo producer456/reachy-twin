@@ -1,9 +1,11 @@
 """RobotHub: one ReachyMini connection shared by the voice loop and the web panel.
 
-Thread-safety: all robot media access (speak + mic capture) is serialized by a single
-lock. The mic capture loop grabs the lock per ~10ms chunk, so a panel-triggered say()
-can slip in between chunks, hold the lock for its playback, and the capture loop simply
-pauses until he's done talking. Brain calls (Claude CLI / Marcus HTTP) are not locked.
+Thread-safety: motion/camera and audio each have their own lock. The mic has exactly
+ONE consumer: the always-on pump thread (_mic_pump), which drains the daemon's recording
+pipeline into a small ring buffer. While he speaks (_speaking set) the pump DISCARDS
+samples, so he can't hear himself; _capture() reads only from the ring buffer. The pump
+must never stop while connected -- an unconsumed pipeline backs up and drops samples
+("Can't record audio fast enough"). Brain calls (Claude CLI / Marcus HTTP) are not locked.
 
 Speech is queued: chat()/say() return as soon as the reply text is known; a single
 worker thread synthesizes + plays in order, so HTTP callers never wait out the audio.
@@ -55,6 +57,10 @@ class RobotHub:
         self._lock = threading.Lock()          # serializes SERVO/motion + camera access
         self._audio_lock = threading.Lock()    # serializes the AUDIO pipeline (speaker/mic), separate from motion
         self._speaking = threading.Event()      # set while a reply is playing out loud
+        self._connect_lock = threading.Lock()  # supervisor + /api/robot/reconnect must not double-connect
+        # mic ring buffer: the pump is the ONLY reader of the SDK mic; _capture reads here
+        self._mic_buf = deque(maxlen=512)      # ~10ms chunks -> a few seconds of backlog max
+        self._pump_stop = None                 # per-connection stop event for the mic pump
         self._listening = False
         self._stop = threading.Event()
         self._thread = None
@@ -120,6 +126,12 @@ class RobotHub:
 
     # ---------- lifecycle ----------
     def start(self):
+        with self._connect_lock:
+            self._start_locked()
+
+    def _start_locked(self):
+        if self.mini is not None:  # supervisor + reconnect raced; the link is already up
+            return
         # On Windows the LOCAL/GStreamer-IPC camera path is broken, so let the env
         # force webrtc (cross-platform). Default behavior unchanged for Linux/macOS.
         backend = os.environ.get("REACHY_MEDIA_BACKEND", "default")
@@ -134,6 +146,7 @@ class RobotHub:
             raise
         self.mini = mini           # publish only once fully usable
         self.last_error = None
+        self._start_mic_pump(mini)
         try:
             self._load_moves()
         except Exception as e:
@@ -160,6 +173,8 @@ class RobotHub:
 
     def _teardown_mini(self):
         mini, self.mini = self.mini, None
+        if self._pump_stop is not None:
+            self._pump_stop.set()       # the pump dies with its connection
         if mini is None:
             return
         try:
@@ -353,20 +368,20 @@ class RobotHub:
                         pass
                 mt = threading.Thread(target=_run, daemon=True)
                 mt.start()
-            total_dur = 0.0
-            t0 = None                                            # playback starts at FIRST push
+            # Each chunk starts playing at max(previous chunk's end, its push time) --
+            # if synthesis runs slower than realtime, playback has gaps and ends later
+            # than sum-of-durations. Track the real end so _speaking covers ALL of it
+            # (the mic pump discards while _speaking; clearing early = echo).
+            play_end = None
             for ch in chunks:
                 samples = self.tts.synth(ch, voice=voice)        # CPU, outside the lock
                 with self._audio_lock:
                     self.mini.media.push_audio_sample(samples)   # queues; playback is continuous
-                if t0 is None:
-                    t0 = time.time()
-                total_dur += len(samples) / SR
-            while t0 is not None and time.time() - t0 < total_dur + 0.3:
-                with self._audio_lock:
-                    s = self.mini.media.get_audio_sample()       # drain mic so we don't hear ourselves
-                if s is None or len(s) == 0:
-                    time.sleep(0.005)
+                pushed = time.time()
+                base = pushed if (play_end is None or play_end < pushed) else play_end
+                play_end = base + len(samples) / SR
+            while play_end is not None and time.time() < play_end + 0.3:
+                time.sleep(0.02)                 # mic discard is the pump's job now
             if mt is not None:
                 mt.join(timeout=4)
         finally:
@@ -498,16 +513,47 @@ class RobotHub:
                     self._log("system", f"mic loop error (continuing): {e}")
                 time.sleep(0.3)
 
+    # ---------- mic pump (single consumer of the robot mic) ----------
+    # The daemon's recording pipeline NEEDS a constant consumer or it backs up and
+    # drops samples ("Can't record audio fast enough" spam). This thread is that
+    # consumer for the life of one connection. While he speaks, samples are
+    # DISCARDED (anti-echo) -- the old design had _capture and the speech drain
+    # racing for the same samples, so he could hear and transcribe himself.
+    def _start_mic_pump(self, mini):
+        self._mic_buf.clear()
+        self._pump_stop = threading.Event()
+        threading.Thread(target=self._mic_pump, args=(mini, self._pump_stop),
+                         daemon=True).start()
+
+    def _mic_pump(self, mini, stop):
+        while not stop.is_set():
+            try:
+                with self._audio_lock:
+                    s = mini.media.get_audio_sample()
+            except Exception:
+                time.sleep(0.1)                  # link hiccup; supervisor handles real death
+                continue
+            if s is None or len(s) == 0:
+                time.sleep(0.005)                # don't spin a core on an idle pipeline
+                continue
+            if self._speaking.is_set() or not self._listening:
+                self._mic_buf.clear()            # discard: his own voice / nobody listening
+                continue
+            self._mic_buf.append(_mono(s))
+
     def _capture(self, max_seconds=15.0):
         buf, in_speech, run, silence = [], False, 0, 0
         start = time.time()
         while not self._stop.is_set() and time.time() - start < max_seconds:
-            with self._audio_lock:
-                s = self.mini.media.get_audio_sample()
-            if s is None or len(s) == 0:
-                time.sleep(0.005)                # don't spin a core on an idle pipeline
+            if self._speaking.is_set():          # he's talking: drop any half-built
+                buf, in_speech, run, silence = [], False, 0, 0   # utterance, start fresh after
+                time.sleep(0.05)
                 continue
-            m = _mono(s)
+            try:
+                m = self._mic_buf.popleft()      # fed by the mic pump
+            except IndexError:
+                time.sleep(0.005)
+                continue
             loud = _rms(m) > self._thresh
             if not in_speech:
                 if loud:

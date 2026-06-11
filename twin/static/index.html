@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Reachy Twin Control</title>
 <style>
   :root{
@@ -11,12 +11,13 @@
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.4 system-ui,Segoe UI,sans-serif;
-       display:flex;flex-direction:column;height:100vh}
+       display:flex;flex-direction:column;height:100vh;height:100dvh}
   header{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line);
          background:linear-gradient(90deg,#101324,#161a2e)}
   header h1{font-size:17px;margin:0;letter-spacing:.5px}
   header h1 b{color:var(--claude)} header h1 i{color:var(--marcus);font-style:normal}
-  .status{margin-left:auto;display:flex;gap:14px;align-items:center;font-size:13px;color:var(--dim)}
+  .status{margin-left:auto;display:flex;gap:14px;align-items:center;font-size:13px;color:var(--dim);flex-wrap:wrap}
+  .dot.err{background:var(--marcus);box-shadow:0 0 8px var(--marcus)}
   .dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:#444;margin-right:5px}
   .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
   .badge{padding:3px 10px;border-radius:20px;font-weight:600;font-size:12px;border:1px solid var(--line)}
@@ -30,13 +31,17 @@
   .msg.marcus{align-self:flex-start;background:#33121f;border:1px solid var(--marcus)}
   .msg.system{align-self:center;color:var(--dim);font-size:12px;background:none}
   .who{font-size:11px;text-transform:uppercase;letter-spacing:.6px;opacity:.7;margin-bottom:2px}
-  aside{width:240px;border-left:1px solid var(--line);background:var(--panel);padding:16px;display:flex;
-        flex-direction:column;gap:18px;overflow-y:auto}
+  aside{width:clamp(240px,26vw,300px);border-left:1px solid var(--line);background:var(--panel);padding:16px;
+        display:flex;flex-direction:column;gap:18px;overflow-y:auto}
+  /* groups must never flex-shrink into each other — the aside scrolls instead */
+  aside .grp{flex:0 0 auto}
+  aside .grp.fill{flex:1 1 auto;min-height:170px;display:flex;flex-direction:column}
   .cam{width:100%;border-radius:8px;border:1px solid var(--line);margin-top:8px;display:none;background:#000}
   .jog{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}
   .jog button{padding:8px 0;font-size:13px}
   .jog .sp{visibility:hidden}
-  .jog2{display:flex;gap:5px;margin-top:5px}
+  .jog2{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-top:5px}
+  .jog2 button{padding:8px 0;font-size:12px;min-width:0;white-space:nowrap}
   .servos{display:none;margin-top:8px;font-size:13px;font-family:ui-monospace,monospace}
   .servos .sv{display:flex;justify-content:space-between;padding:2px 0}
   .servos .sv span:first-child{color:var(--dim)}
@@ -44,7 +49,7 @@
   .grp label{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim)}
   .row{display:flex;gap:8px;margin-top:8px}
   button{cursor:pointer;border:1px solid var(--line);background:#1c2138;color:var(--txt);
-         padding:9px 12px;border-radius:9px;font-size:14px;flex:1;transition:.15s}
+         padding:9px 12px;border-radius:9px;font-size:14px;flex:1;min-width:0;transition:.15s}
   button:hover{border-color:#3a4160}
   button.sel.claude{background:var(--claude);color:#022;border-color:var(--claude)}
   button.sel.marcus{background:var(--marcus);color:#201;border-color:var(--marcus)}
@@ -62,10 +67,20 @@
   .bh{width:100%;text-align:left}
   .bh.on{background:var(--ok);color:#022;border-color:var(--ok)}
   .bh:disabled{opacity:.4;cursor:not-allowed}
-  footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line);background:var(--panel)}
+  footer{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line);background:var(--panel);
+         padding-bottom:calc(12px + env(safe-area-inset-bottom))}
   #text{flex:1;background:#0e1120;border:1px solid var(--line);color:var(--txt);border-radius:10px;
-        padding:11px 14px;font-size:15px}
+        padding:11px 14px;font-size:16px} /* 16px: stops iOS Safari zooming the page on focus */
   #send{flex:0 0 auto;width:90px;background:var(--claude);color:#022;border:none;font-weight:600}
+  @media (pointer:coarse){
+    button{padding:11px 12px}
+    .chip{padding:9px 12px;font-size:13px}
+  }
+  /* very narrow (phone / iPad split view): stack the controls under the chat */
+  @media (max-width:700px){
+    main{flex-direction:column}
+    aside{width:100%;border-left:none;border-top:1px solid var(--line);max-height:48dvh}
+  }
 </style>
 </head>
 <body>
@@ -73,8 +88,10 @@
   <h1>Reachy <b>Twin</b> <span style="color:var(--dim)">·</span> <i>♥</i> Control</h1>
   <div class="status">
     <span>active <span id="activeBadge" class="badge claude">claude</span></span>
+    <span id="robotWrap" title=""><span id="robotDot" class="dot"></span>robot</span>
     <span><span id="micDot" class="dot"></span>mic</span>
     <span id="vol">vol —</span>
+    <span id="sleepBadge" style="display:none">💤</span>
   </div>
 </header>
 <main>
@@ -102,6 +119,7 @@
         <button id="bhTurn" class="bh" onclick="toggleBh('turn_to_sound')">Turn to sound</button>
         <button id="bhEmo" class="bh" onclick="toggleBh('emotions_on_cue')">Emotions on cue</button>
         <button id="bhFace" class="bh" onclick="toggleBh('face_track')">Face-track</button>
+        <button id="bhIdle" class="bh" onclick="toggleBh('idle_motion')">Idle motion</button>
       </div>
     </div>
     <div class="grp">
@@ -134,7 +152,7 @@
       <div class="row"><button id="servoBtn" onclick="toggleServos()">Show servo activity</button></div>
       <div id="servos" class="servos"></div>
     </div>
-    <div class="grp" style="flex:1;min-height:0;display:flex;flex-direction:column">
+    <div class="grp fill">
       <label>Expressions</label>
       <div class="tabs">
         <button id="tabEmotions" class="on" onclick="showMoves('emotions')">Emotions</button>
@@ -152,8 +170,9 @@
 <script>
 let dragging=false, lastLogLen=-1;
 const $=id=>document.getElementById(id);
-$('volSlider').addEventListener('mousedown',()=>dragging=true);
-$('volSlider').addEventListener('mouseup',()=>dragging=false);
+$('volSlider').addEventListener('pointerdown',()=>dragging=true);
+$('volSlider').addEventListener('pointerup',()=>dragging=false);
+$('volSlider').addEventListener('pointercancel',()=>dragging=false);
 
 async function api(path,body){
   const o={method:body?'POST':'GET'};
@@ -186,7 +205,11 @@ async function refresh(){
       $('bhTurn').className='bh'+(s.behaviors.turn_to_sound?' on':'');
       $('bhEmo').className='bh'+(s.behaviors.emotions_on_cue?' on':'');
       $('bhFace').className='bh'+(s.behaviors.face_track?' on':'');
+      $('bhIdle').className='bh'+(s.behaviors.idle_motion?' on':'');
     }
+    $('robotDot').className='dot'+(s.robot==='connected'?' on':' err');
+    $('robotWrap').title=s.robot_error||'';
+    $('sleepBadge').style.display=s.asleep?'inline':'none';
     renderLog(s.log);
   }catch(e){}
 }
