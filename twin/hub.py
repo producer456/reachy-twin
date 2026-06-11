@@ -52,7 +52,9 @@ class RobotHub:
         self.active = "claude"
         self.mini = None
         self.last_error = None     # last robot-connect failure (shown in /api/state)
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # serializes SERVO/motion + camera access
+        self._audio_lock = threading.Lock()    # serializes the AUDIO pipeline (speaker/mic), separate from motion
+        self._speaking = threading.Event()      # set while a reply is playing out loud
         self._listening = False
         self._stop = threading.Event()
         self._thread = None
@@ -61,7 +63,8 @@ class RobotHub:
         self.emotions = None       # RecordedMoves (lazy)
         self._dances = None        # list[str]
         # autonomous behaviors
-        self.behaviors = {"turn_to_sound": False, "face_track": False, "emotions_on_cue": False}
+        self.behaviors = {"turn_to_sound": False, "face_track": False,
+                          "emotions_on_cue": False, "idle_motion": False}
         self._behavior_stop = threading.Event()
         self._behavior_thread = None
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
@@ -70,7 +73,13 @@ class RobotHub:
         # under the gaze in ONE smooth move with the head counter-rotating.
         self._doa_hist = deque(maxlen=3)   # recent (t, absolute target yaw) candidates
         self._move_until = 0.0             # wall-clock end of in-flight goto; don't interrupt
+        self._manual_until = 0.0           # behaviors stand down until here after a manual jog/look/center
         self._follow_since = None          # dwell timer before the body commits
+        # idle "aliveness" layer (gentle breathing + slow recenter when nothing else is happening)
+        self._active_ts = 0.0              # last real activity (gaze/face/follow/manual/speech)
+        self._last_idle = 0.0              # throttle for the idle tick
+        self._asleep = False               # sleep/wake: behaviors+pose parked, restored on wake
+        self._sleep_state = None           # snapshot taken at sleep() to restore at wake()
         self._vol_cache = None     # cache slow /api/volume/current
         self._vol_ts = 0.0
         self._vol_refreshing = False
@@ -137,6 +146,7 @@ class RobotHub:
         self.set_behavior("face_track", True)
         self.set_behavior("turn_to_sound", True)
         self.set_behavior("emotions_on_cue", True)
+        self.set_behavior("idle_motion", True)
 
     def shutdown(self):
         self._supervisor_stop.set()
@@ -327,12 +337,18 @@ class RobotHub:
         speech layer instead of fighting.
         """
         chunks = self._sentences(text)
-        with self._lock:
+        # Speaking uses the AUDIO lock, not the motion lock, so a manual jog (and
+        # the emotion move below) can run while he talks instead of freezing for
+        # the whole reply. Synthesis is pure CPU -> never under any lock.
+        self._speaking.set()
+        self._active_ts = time.time()
+        try:
             mt = None
             if move is not None:
                 def _run():
                     try:
-                        self.mini.play_move(move, sound=False)   # motion only; speech is the audio
+                        with self._lock:                         # motion lock; serializes with jogs
+                            self.mini.play_move(move, sound=False)  # motion only; speech is the audio
                     except Exception:
                         pass
                 mt = threading.Thread(target=_run, daemon=True)
@@ -340,17 +356,22 @@ class RobotHub:
             total_dur = 0.0
             t0 = None                                            # playback starts at FIRST push
             for ch in chunks:
-                samples = self.tts.synth(ch, voice=voice)
-                self.mini.media.push_audio_sample(samples)       # queues; playback is continuous
+                samples = self.tts.synth(ch, voice=voice)        # CPU, outside the lock
+                with self._audio_lock:
+                    self.mini.media.push_audio_sample(samples)   # queues; playback is continuous
                 if t0 is None:
                     t0 = time.time()
                 total_dur += len(samples) / SR
             while t0 is not None and time.time() - t0 < total_dur + 0.3:
-                s = self.mini.media.get_audio_sample()           # drain mic so we don't hear ourselves
+                with self._audio_lock:
+                    s = self.mini.media.get_audio_sample()       # drain mic so we don't hear ourselves
                 if s is None or len(s) == 0:
                     time.sleep(0.005)
             if mt is not None:
                 mt.join(timeout=4)
+        finally:
+            self._speaking.clear()
+            self._active_ts = time.time()
 
     # ---------- chat ----------
     THINK_FILLERS = ["Hmm.", "Hm, let me think.", "Mmm.", "Oh!", "Good question."]
@@ -412,6 +433,9 @@ class RobotHub:
                 reply = f"{self.active.capitalize()} here. What's up?"
             else:
                 reply = self.brains[self.active].reply(msg)
+        except Exception as e:                   # an API/network error must not 500 the route
+            self._log("system", f"brain '{self.active}' error: {e}")
+            reply = "Sorry, my brain hiccuped for a second there -- say that again?"
         finally:
             self._thinking.clear()               # stop the flutter; time to talk
         mood, reply = strip_mood(reply)          # pull the brain's [mood] tag off the speech
@@ -453,24 +477,32 @@ class RobotHub:
 
     def _mic_loop(self):
         while not self._stop.is_set():
-            audio = self._capture()
-            if audio is None:
-                continue
-            text = self.stt.transcribe(audio)
-            if not text or len(text) < 2:
-                continue
-            if any(w in text.lower() for w in EXIT_WORDS):
-                self.say("Okay, going quiet. Bye.")
-                self._listening = False
-                self._stop.set()
-                break
-            self.chat(text, spoken=True)
+            try:
+                audio = self._capture()
+                if audio is None:
+                    continue
+                text = self.stt.transcribe(audio)
+                if not text or len(text) < 2:
+                    continue
+                if any(w in text.lower() for w in EXIT_WORDS):
+                    self.say("Okay, going quiet. Bye.")
+                    self._listening = False
+                    self._stop.set()
+                    break
+                self.chat(text, spoken=True)
+            except Exception as e:
+                # one STT/capture hiccup must not silently end listening
+                now = time.time()
+                if now - getattr(self, "_last_mic_err", 0) > 30:
+                    self._last_mic_err = now
+                    self._log("system", f"mic loop error (continuing): {e}")
+                time.sleep(0.3)
 
     def _capture(self, max_seconds=15.0):
         buf, in_speech, run, silence = [], False, 0, 0
         start = time.time()
         while not self._stop.is_set() and time.time() - start < max_seconds:
-            with self._lock:
+            with self._audio_lock:
                 s = self.mini.media.get_audio_sample()
             if s is None or len(s) == 0:
                 time.sleep(0.005)                # don't spin a core on an idle pipeline
@@ -533,7 +565,8 @@ class RobotHub:
     def set_behavior(self, name, on):
         if name in self.behaviors:
             self.behaviors[name] = bool(on)
-        need_thread = self.behaviors["turn_to_sound"] or self.behaviors["face_track"]
+        need_thread = (self.behaviors["turn_to_sound"] or self.behaviors["face_track"]
+                       or self.behaviors["idle_motion"])
         if need_thread and (self._behavior_thread is None or not self._behavior_thread.is_alive()):
             self._behavior_stop.clear()
             self._behavior_thread = threading.Thread(target=self._behavior_loop, daemon=True)
@@ -546,9 +579,16 @@ class RobotHub:
 
     def _behavior_loop(self):
         while not self._behavior_stop.is_set() and (
-                self.behaviors["turn_to_sound"] or self.behaviors["face_track"]):
+                self.behaviors["turn_to_sound"] or self.behaviors["face_track"]
+                or self.behaviors["idle_motion"]):
             if self._recording_gesture:          # hands-off while being hand-guided
                 time.sleep(0.2)
+                continue
+            if self._speaking.is_set():           # let the emotion-move own the body while talking
+                time.sleep(0.1)
+                continue
+            if time.time() < self._manual_until:  # a human just jogged/looked -- don't fight it
+                time.sleep(0.06)
                 continue
             try:
                 if self.behaviors["face_track"]:
@@ -560,6 +600,8 @@ class RobotHub:
                         or time.time() - self._face_seen_ts > self.FACE_HOLDS_GAZE_S):
                     self._gaze_tick()
                 self._follow_tick()     # always-on postural layer: body follows a held head turn
+                if self.behaviors["idle_motion"]:
+                    self._idle_tick()   # gentle breathing + recenter when nothing else is happening
             except Exception as e:
                 # an SDK hiccup (e.g. goto_target TimeoutError) must never kill
                 # this thread -- that silently disables every behavior until restart
@@ -604,7 +646,7 @@ class RobotHub:
         if now < self._move_until:           # let the in-flight move finish
             return
         try:
-            with self._lock:
+            with self._audio_lock:
                 doa = self.mini.media.get_DoA()
         except Exception:
             return
@@ -635,6 +677,7 @@ class RobotHub:
             self.mini.goto_target(head=pose, duration=self.SACCADE_S)
         self._move_until = now + self.SACCADE_S + 0.05
         self._follow_since = now             # follow dwell starts at the glance
+        self._active_ts = now                # real activity -> hold off idle motion
 
     def _follow_tick(self):
         now = time.time()
@@ -671,6 +714,48 @@ class RobotHub:
                 pose = create_head_pose(yaw=float(np.rad2deg(new_head)), degrees=True)
                 self.mini.goto_target(head=pose, body_yaw=new_body, duration=self.FOLLOW_S)
         self._move_until = now + self.FOLLOW_S + 0.1
+        self._active_ts = now
+
+    # ---------- idle "aliveness" ----------
+    # When nothing else is going on, a calm breathing-like sway keeps him from
+    # looking switched-off, and he eases back toward neutral so he doesn't sit
+    # frozen staring off-axis. Everything here is small, slow, and strictly gated
+    # so it never fights gaze / face-track / follow / a manual jog / speech.
+    IDLE_AFTER = 6.0           # seconds of calm before idle motion starts
+    IDLE_SWAY_DEG = 1.6        # whole-body sway amplitude (kept tiny)
+    IDLE_PITCH_DEG = 1.4       # head breathing-nod amplitude
+    IDLE_YAW_DEG = 2.5         # slow lazy head-yaw wander
+    IDLE_RECENTER = 0.06       # fraction of any off-center baseline shed per tick
+    IDLE_TICK_S = 0.5          # ~2 Hz: gentle on the servos
+
+    def _idle_tick(self):
+        now = time.time()
+        # Only when truly idle: not talking/thinking/being hand-guided, no move in
+        # flight, past the manual-hold, and nothing has steered him recently.
+        if (self._speaking.is_set() or self._thinking.is_set() or self._recording_gesture
+                or now < self._move_until or now < self._manual_until
+                or now - self._active_ts < self.IDLE_AFTER):
+            return
+        if now - self._last_idle < self.IDLE_TICK_S:
+            return
+        self._last_idle = now
+        # ease the resting baseline back toward neutral (return-to-center when left alone)
+        for k in ("yaw", "pitch", "body"):
+            self._pose[k] *= (1.0 - self.IDLE_RECENTER)
+        # layered slow sines at incommensurate periods -> organic, non-repetitive
+        # sway, added ON TOP of (not stored in) the baseline so jog/center stay
+        # authoritative.
+        body = self._pose["body"] + self.IDLE_SWAY_DEG * np.sin(now / 11.0 * 2 * np.pi)
+        pitch = self._pose["pitch"] + self.IDLE_PITCH_DEG * np.sin(now / 7.0 * 2 * np.pi + 1.0)
+        yaw = self._pose["yaw"] + self.IDLE_YAW_DEG * np.sin(now / 17.0 * 2 * np.pi)
+        from reachy_mini.utils import create_head_pose
+        head = create_head_pose(yaw=yaw, pitch=pitch, degrees=True)
+        try:
+            with self._lock:
+                self.mini.goto_target(head=head, body_yaw=np.deg2rad(body),
+                                      duration=self.IDLE_TICK_S * 1.4)
+        except Exception:
+            pass
 
     def _detect_faces(self, frame):
         import os
@@ -705,6 +790,7 @@ class RobotHub:
         if len(faces) == 0:
             return False
         self._face_seen_ts = now                             # eyes have a target
+        self._active_ts = now                                # real activity -> hold off idle motion
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])   # largest face
         cx, cy = x + w // 2, y + h // 2
         H, W = frame.shape[:2]
@@ -880,15 +966,19 @@ class RobotHub:
     ANT_REST_DEG = 8   # antennas held at exactly 0 deg hunt (backlash); a small offset stops it
 
     def _apply_pose(self):
-        if self.mini is None:
+        mini = self.mini                       # snapshot: the supervisor may null it mid-call
+        if mini is None:
             return dict(self._pose)
         from reachy_mini.utils import create_head_pose
         p = self._pose
         head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
         ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
-        with self._lock:
-            self.mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
-                                  antennas=ant, duration=0.35)
+        try:
+            with self._lock:
+                mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
+                                 antennas=ant, duration=0.35)
+        except Exception as e:                 # link dropped mid-move -> don't 500 the endpoint
+            self._log("system", f"apply_pose failed (link?): {e}")
         return dict(self._pose)
 
     def servos(self):
@@ -923,23 +1013,47 @@ class RobotHub:
         out["mode"] = self._cached_mode
         return out
 
+    # A manual jog/look/center suppresses the autonomous behaviors this long, so
+    # turn-to-sound / face-track / follow don't immediately revert the human's move.
+    MANUAL_HOLD_S = 4.0
+
+    def _mark_manual(self, hold=None):
+        """Tell the behavior loop a human is driving -- stand down until `hold` secs."""
+        now = time.time()
+        self._manual_until = now + (self.MANUAL_HOLD_S if hold is None else hold)
+        self._active_ts = now              # real activity -> hold off idle motion
+
     def look(self, yaw_deg, pitch_deg):
         """Aim the head at an absolute yaw/pitch -- used by the iPad app's Vision
         face-tracking. Routed through _pose so look, jog, and center share one state."""
-        self._pose["yaw"] = max(-self._JOG_LIMITS["yaw"], min(self._JOG_LIMITS["yaw"], float(yaw_deg)))
-        self._pose["pitch"] = max(-self._JOG_LIMITS["pitch"], min(self._JOG_LIMITS["pitch"], float(pitch_deg)))
+        y, p = float(yaw_deg), float(pitch_deg)
+        if not (np.isfinite(y) and np.isfinite(p)):   # reject NaN/inf from a tracker glitch
+            return dict(self._pose)
+        self._pose["yaw"] = max(-self._JOG_LIMITS["yaw"], min(self._JOG_LIMITS["yaw"], y))
+        self._pose["pitch"] = max(-self._JOG_LIMITS["pitch"], min(self._JOG_LIMITS["pitch"], p))
+        # Short hold: the iPad streams look() continuously, so this just keeps the
+        # hub's own behaviors from fighting the external tracker while it's active.
+        self._mark_manual(hold=1.5)
         return self._apply_pose()
 
     def jog(self, part, delta):
-        if part in self._pose:
-            if part == "body":
-                # the gaze controller moves the body behind _pose's back; re-sync from
-                # the servos so a jog nudges from where he ACTUALLY is, not a stale target
-                b, _ = self._read_yaws()
-                if b is not None:
-                    self._pose["body"] = float(np.rad2deg(b))
-            lim = self._JOG_LIMITS[part]
-            self._pose[part] = max(-lim, min(lim, self._pose[part] + float(delta)))
+        if part not in self._pose:
+            return dict(self._pose)
+        d = float(delta)
+        if not np.isfinite(d):                # reject a bad delta rather than command NaN
+            return dict(self._pose)
+        # Re-sync from the servos for the axes the behavior layer moves behind
+        # _pose's back, so a jog nudges from where he ACTUALLY is, not a stale target.
+        b, y, p = self._read_pose()
+        if part == "body" and b is not None:
+            self._pose["body"] = float(np.rad2deg(b))
+        elif part == "yaw" and y is not None:
+            self._pose["yaw"] = float(np.rad2deg(y))
+        elif part == "pitch" and p is not None:
+            self._pose["pitch"] = float(np.rad2deg(p))
+        lim = self._JOG_LIMITS[part]
+        self._pose[part] = max(-lim, min(lim, self._pose[part] + d))
+        self._mark_manual()
         return self._apply_pose()
 
     def center(self):
@@ -947,7 +1061,83 @@ class RobotHub:
             self._pose[k] = 0.0
         self._doa_hist.clear()
         self._follow_since = None
+        self._mark_manual()
         return self._apply_pose()
+
+    # ---------- sleep / wake ----------
+    # Sleep snapshots how he's set up + where he's posed, parks the behaviors,
+    # stops listening, nods to a rest pose and relaxes the motors. Wake powers
+    # back up and restores exactly that snapshot.
+    _SLEEP_POSE = {"yaw": 0.0, "roll": 0.0, "pitch": 20.0, "body": 0.0, "ant": -14.0}
+    SLEEP_ANIM = "sleep1"        # graceful "nodding off" emotion
+    WAKE_ANIM = "welcoming1"     # cute perk-up greeting on wake (try cheerful1 / curious1 / surprised1)
+
+    def sleep(self):
+        if self._asleep:
+            return {"asleep": True}
+        # Remember how he was set up so wake() can put it all back.
+        self._sleep_state = {
+            "behaviors": dict(self.behaviors),
+            "listening": self._listening,
+            "brain": self.active,
+            "pose": dict(self._pose),
+        }
+        for k in list(self.behaviors):          # stop all autonomous motion
+            self.set_behavior(k, False)
+        if self._listening:                     # stop the mic
+            self.set_listening(False)
+        self._asleep = True
+        # Play the "going to sleep" emotion so his head settles gracefully into a
+        # rest pose, and HOLD it (motors stay on) -- cutting the motors made the
+        # head droop. Falls back to a manual rest pose if the library is missing.
+        try:
+            self._load_moves()
+            with self._lock:
+                self.mini.play_move(self.emotions.get(self.SLEEP_ANIM))
+        except Exception as e:
+            self._log("system", f"sleep anim unavailable: {e}")
+        # The emotion ends back at neutral/alert, so settle him into a held rest
+        # pose (head dipped, antennas down) -- slow + smooth -- so he actually
+        # ENDS looking asleep. Motors stay on, so no droop.
+        self._pose.update(self._SLEEP_POSE)
+        try:
+            from reachy_mini.utils import create_head_pose
+            p = self._pose
+            head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
+            ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
+            with self._lock:
+                self.mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
+                                      antennas=ant, duration=1.5)
+        except Exception:
+            self._apply_pose()
+        self._log("system", "💤 asleep")
+        return {"asleep": True}
+
+    def wake(self):
+        if not self._asleep:
+            return {"asleep": False}
+        st = self._sleep_state or {}
+        self._asleep = False
+        # cute perk-up greeting, then settle back to how he was
+        try:
+            self._load_moves()
+            with self._lock:
+                self.mini.play_move(self.emotions.get(self.WAKE_ANIM))
+        except Exception as e:
+            self._log("system", f"wake anim unavailable: {e}")
+        if "pose" in st:                         # smoothly back to where he was
+            self._pose.update(st["pose"])
+            self._apply_pose()
+        if st.get("brain") in self.brains:
+            self.active = st["brain"]
+        for k, v in st.get("behaviors", {}).items():
+            self.set_behavior(k, v)
+        if st.get("listening"):
+            self.set_listening(True)
+        self._sleep_state = None
+        self._mark_manual()                      # grace period before behaviors re-engage
+        self._log("system", "☀️ awake")
+        return {"asleep": False}
 
     # ---------- volume (proxy daemon) ----------
     def get_volume(self):
@@ -963,14 +1153,15 @@ class RobotHub:
         r"(?:\s+(?:yourself|it|the\s+(?:volume|sound|audio)))?\s*[.!]*", re.I)
     _VOL_NUM_RX = re.compile(r"\b(?:set|turn|put)?\s*(?:the\s+)?volume\s+(?:up\s+|down\s+)?(?:to|at)?\s*(\d{1,3})\b", re.I)
     _VOL_DOWN_RX = re.compile(r"\b(quieter|too loud|turn (?:it|the volume) down|turn down|volume down|softer|less loud|lower (?:the )?(?:volume|it))\b", re.I)
-    _VOL_UP_RX = re.compile(r"\b(louder|speak up|turn (?:it|the volume) up|turn up|can'?t hear|volume up|more volume)\b", re.I)
+    # "can't hear" alone hijacks "I can't hear the TV" -- require it to be about him.
+    _VOL_UP_RX = re.compile(r"\b(louder|speak up|turn (?:it|the volume) up|turn up|can'?t hear (?:you|ya|u)|volume up|more volume)\b", re.I)
 
     def _maybe_volume_command(self, text):
         """Intercept spoken/typed volume commands. Returns True if handled (no brain call)."""
         t = text.lower().strip()
-        v = self.get_volume().get("volume")
-        cur = int(v) if isinstance(v, (int, float)) else 60
-        target = None
+        # Decide the command from the text FIRST; only consult the (cached, never
+        # blocking) current volume for the relative up/down cases. This keeps a
+        # slow/down volume daemon from adding latency to every normal chat turn.
         if self._MUTE_RX.fullmatch(t):
             target = 0
         elif "volume" in t and re.search(r"\b(max|full|loudest|all the way)\b", t):
@@ -978,10 +1169,12 @@ class RobotHub:
         elif (m := self._VOL_NUM_RX.search(t)):
             target = int(m.group(1))
         elif self._VOL_DOWN_RX.search(t):
-            target = cur - 15
+            cur = self._volume_cached()
+            target = (cur if isinstance(cur, (int, float)) else 60) - 15
         elif self._VOL_UP_RX.search(t):
-            target = cur + 15
-        if target is None:
+            cur = self._volume_cached()
+            target = (cur if isinstance(cur, (int, float)) else 60) + 15
+        else:
             return False
         target = max(0, min(100, target))
         self.set_volume(target)
@@ -1027,6 +1220,7 @@ class RobotHub:
             "brains": list(self.brains),
             "voices": self.voices,
             "behaviors": self.behaviors,
+            "asleep": self._asleep,
             "robot": "connected" if self.robot_connected else "disconnected",
             "robot_error": None if self.robot_connected else self.last_error,
             "log": list(self.log)[-40:],

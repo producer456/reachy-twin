@@ -50,6 +50,10 @@ class ListenReq(BaseModel):
     on: bool
 
 
+class SleepReq(BaseModel):
+    on: bool   # true = sleep, false = wake
+
+
 class VolumeReq(BaseModel):
     volume: int
 
@@ -112,6 +116,11 @@ def post_brain(r: BrainReq):
 @app.post("/api/listen")
 def post_listen(r: ListenReq):
     return {"listening": hub.set_listening(r.on)}
+
+
+@app.post("/api/sleep")
+def post_sleep(r: SleepReq):
+    return hub.sleep() if r.on else hub.wake()
 
 
 @app.post("/api/volume")
