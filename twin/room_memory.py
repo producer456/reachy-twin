@@ -6,17 +6,46 @@ This is just text (a caption is ~150 bytes), so even a 24h window is a megabyte
 or two — retention length is essentially free. The GPU cost lives entirely in
 the captioner (hub side), which gates on real change + Marcus being free.
 """
+import json
+import os
 import threading
 import time
+from pathlib import Path
 
 
 class RoomMemory:
     KINDS = ("vision", "presence", "speech")
+    # Persisted next to the repo's other learned state (faces/, gestures/):
+    # the timeline must survive panel/daemon restarts, or "what did I miss?"
+    # comes back empty after every code deploy.
+    PATH = Path(__file__).resolve().parent.parent / "room_events.json"
 
     def __init__(self, retention_hours=12):
         self._lock = threading.RLock()
         self._events = []            # [{t, kind, text}], oldest first
         self.retention_hours = retention_hours
+        self._load()
+
+    def _load(self):
+        try:
+            data = json.loads(self.PATH.read_text(encoding="utf-8"))
+            cutoff = time.time() - self.retention_hours * 3600
+            with self._lock:
+                self._events = [e for e in data if isinstance(e, dict)
+                                and float(e.get("t", 0)) >= cutoff]
+        except Exception:
+            pass                      # no file yet / unreadable -> start empty
+
+    def _save(self):
+        try:
+            with self._lock:
+                blob = json.dumps(self._events)
+            tmp = str(self.PATH) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(blob)
+            os.replace(tmp, self.PATH)
+        except Exception:
+            pass                      # persistence is best-effort
 
     def set_retention(self, hours):
         try:
@@ -37,9 +66,11 @@ class RoomMemory:
             if self._events and self._events[-1]["kind"] == kind \
                     and self._events[-1]["text"] == text:
                 self._events[-1]["t"] = time.time()
+                self._save()
                 return
             self._events.append({"t": time.time(), "kind": kind, "text": text})
         self._prune()
+        self._save()
 
     def _prune(self):
         cutoff = time.time() - self.retention_hours * 3600

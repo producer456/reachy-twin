@@ -17,6 +17,7 @@ import base64
 import glob
 import json
 import os
+from pathlib import Path
 import queue
 import random
 import re
@@ -91,7 +92,7 @@ class RobotHub:
         # autonomous behaviors
         self.behaviors = {"turn_to_sound": False, "face_track": False,
                           "emotions_on_cue": False, "idle_motion": False,
-                          "room_memory": False}
+                          "room_memory": False, "only_david": False}
         self._behavior_stop = threading.Event()
         self._behavior_thread = None
         # rolling room memory (on-demand recall only); its own slow thread so the
@@ -196,6 +197,8 @@ class RobotHub:
         self.set_behavior("turn_to_sound", True)
         self.set_behavior("emotions_on_cue", True)
         self.set_behavior("idle_motion", True)
+        # ...and David's opt-ins (room memory, voice gate) come back as he left them
+        self._restore_behavior_state()
 
     def shutdown(self):
         self._supervisor_stop.set()
@@ -666,6 +669,39 @@ class RobotHub:
             self._stop.set()
         return self._listening
 
+    # ---------- speaker gate (only-respond-to-David mode) ----------
+    def _is_david(self, audio_16k: "np.ndarray") -> bool:
+        """Ask Marcus's voiceprint whether this utterance is David. FAIL-OPEN:
+        any error (network, profile missing, clip too short) returns True so a
+        hiccup can never lock David out of his own robot."""
+        if not MARCUS_URL:
+            return True
+        try:
+            import io
+            import wave
+            pcm = (np.clip(audio_16k, -1.0, 1.0) * 32767).astype(np.int16)
+            bio = io.BytesIO()
+            with wave.open(bio, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm.tobytes())
+            req = urllib.request.Request(
+                MARCUS_URL.rstrip("/") + "/voice/identify", data=bio.getvalue(),
+                headers={"Content-Type": "audio/wav"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                out = json.loads(r.read().decode())
+            verdict = out.get("is_david")
+            if verdict is None:        # no profile yet / clip too short -> don't gate
+                return True
+            self._log("system", f"voice-id match={out.get('match')} david={verdict}")
+            return bool(verdict)
+        except Exception:
+            return True
+
+    VOICE_GATE_ON_RX = re.compile(r"\bonly (listen|respond|reply) to me\b", re.I)
+    VOICE_GATE_OFF_RX = re.compile(r"\b(listen|respond|reply) to (everyone|everybody|anyone)\b", re.I)
+
     def _mic_loop(self):
         while not self._stop.is_set():
             try:
@@ -674,6 +710,22 @@ class RobotHub:
                     continue
                 text = self.stt.transcribe(audio)
                 if not text or len(text) < 2:
+                    continue
+                # Mode toggles are checked BEFORE the gate, so David can always
+                # turn it off by voice — but only if it's actually him.
+                if self.VOICE_GATE_ON_RX.search(text):
+                    if self._is_david(audio):
+                        self.set_behavior("only_david", True)
+                        self.say("Got it -- I'm only listening to you now.")
+                    else:
+                        self.say("That's not the voice I answer to for that.")
+                    continue
+                if self.behaviors.get("only_david") and not self._is_david(audio):
+                    self._log("system", f'voice gate: ignored non-David utterance "{text[:48]}"')
+                    continue
+                if self.VOICE_GATE_OFF_RX.search(text):
+                    self.set_behavior("only_david", False)
+                    self.say("Okay -- I'll listen to everyone again.")
                     continue
                 if any(w in text.lower() for w in EXIT_WORDS):
                     self.say("Okay, going quiet. Bye.")
@@ -784,9 +836,36 @@ class RobotHub:
         return {"ok": True, "kind": kind, "name": name}
 
     # ---------- autonomous behaviors ----------
+    # User OPT-IN behaviors survive restarts (the always-on quartet is re-forced
+    # at every connect, so only these two need remembering). Without this, every
+    # code deploy silently turned room memory and the voice gate back off.
+    _PERSISTED_BEHAVIORS = ("room_memory", "only_david")
+    _BEHAVIOR_STATE_PATH = Path(__file__).resolve().parent.parent / "behavior_state.json"
+
+    def _save_behavior_state(self):
+        try:
+            blob = json.dumps({k: self.behaviors.get(k, False) for k in self._PERSISTED_BEHAVIORS})
+            tmp = str(self._BEHAVIOR_STATE_PATH) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(blob)
+            os.replace(tmp, self._BEHAVIOR_STATE_PATH)
+        except Exception:
+            pass
+
+    def _restore_behavior_state(self):
+        try:
+            saved = json.loads(self._BEHAVIOR_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for k in self._PERSISTED_BEHAVIORS:
+            if saved.get(k):
+                self.set_behavior(k, True)
+
     def set_behavior(self, name, on):
         if name in self.behaviors:
             self.behaviors[name] = bool(on)
+            if name in self._PERSISTED_BEHAVIORS:
+                self._save_behavior_state()
         need_thread = (self.behaviors["turn_to_sound"] or self.behaviors["face_track"]
                        or self.behaviors["idle_motion"])
         if need_thread and (self._behavior_thread is None or not self._behavior_thread.is_alive()):
@@ -1587,7 +1666,9 @@ class RobotHub:
                         obj = json.loads(line[5:].strip())
                     except Exception:
                         continue
-                    if obj.get("done"):
+                    if obj.get("loading"):
+                        return ""      # Marcus mid-reload -> caller's fallback, not
+                    if obj.get("done"):  # "Loading the engine..." spoken as an answer
                         break
                     if "text" in obj:
                         text = obj["text"]
@@ -1618,7 +1699,10 @@ class RobotHub:
         r"catch me up|fill me in|did (?:anything|anyone|something) happen)\b", re.I)
 
     def room_recall(self):
-        """Narrate the rolling memory (Marcus, regardless of the active brain)."""
+        """Narrate the rolling memory (Marcus, regardless of the active brain).
+        If Marcus is unreachable or mid-reload (~70s after a restart), fall back
+        to a DETERMINISTIC digest of the timeline instead of an empty apology —
+        the events are local; only the prose needs the LLM."""
         timeline, _shown, total = self.room.timeline_text()
         if not timeline:
             return "It's been quiet -- I haven't noticed anything worth mentioning."
@@ -1629,10 +1713,35 @@ class RobotHub:
             "mostly quiet, say so. Speak naturally; don't read timestamps literally.\n\nLOG:\n" + timeline)
         from twin.brains import clean_for_speech
         text = clean_for_speech(self._marcus_post(prompt, timeout=60,
-                                                  system_override=self.REACHY_NARRATOR)) or \
-            "I noticed a few things but I'm having trouble putting them into words right now."
+                                                  system_override=self.REACHY_NARRATOR))
+        if not text or "loading" in text.lower()[:60]:
+            text = self._room_digest()
         self._log("system", f"room recall narrated ({total} events)")
         return text
+
+    def _room_digest(self):
+        """LLM-free recall: speak the last few distinct events verbatim."""
+        with self.room._lock:
+            evs = list(self.room._events)
+        if not evs:
+            return "It's been quiet -- I haven't noticed anything worth mentioning."
+        picks, seen = [], set()
+        for e in reversed(evs):                  # newest first, dedup by text
+            t = e["text"].strip()
+            if t and t not in seen:
+                seen.add(t)
+                picks.append(e)
+            if len(picks) >= 4:
+                break
+        picks.reverse()
+        parts = []
+        for e in picks:
+            ts = time.strftime("%-I:%M", time.localtime(e["t"]))
+            parts.append(f"around {ts}, {e['text'].rstrip('.')}")
+        span_h = (evs[-1]["t"] - evs[0]["t"]) / 3600
+        head = f"My storyteller brain is busy, so here's the raw version from the last {span_h:.0f} hours: " \
+            if span_h >= 1 else "My storyteller brain is busy, so here's the raw version: "
+        return head + "; ".join(parts) + "."
 
     # ---- watch modes + "let him ask to see better" ----
     VIEW_CHECK_PROMPT = (
