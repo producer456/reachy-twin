@@ -77,6 +77,10 @@ class WatchReq(BaseModel):
     mode: str       # off | window (hold David's aim) | scan (slow room sweep)
 
 
+class FaceReq(BaseModel):
+    name: Optional[str] = None
+
+
 class JogReq(BaseModel):
     part: str       # pitch | roll | yaw | body | ant
     delta: float    # degrees
@@ -179,6 +183,26 @@ def post_room_recall():
 def post_watch(r: WatchReq):
     """Watch a spot: aim Reachy by hand, then 'window' to hold + caption it."""
     return hub.set_watch(r.mode)
+
+
+@app.get("/api/face")
+def get_face():
+    """Enrolled faces + sample counts."""
+    return {"profiles": hub.face_profile_status()}
+
+
+@app.post("/api/face/enroll")
+def post_face_enroll(r: FaceReq):
+    """Look at the person now and learn their face."""
+    return hub.enroll_face(r.name or "David")
+
+
+@app.post("/api/face/whoami")
+def post_face_whoami():
+    """Look now and say who he sees (also speaks it)."""
+    text = hub.whoami()
+    hub.say(text)
+    return {"text": text, "profiles": hub.face_profile_status()}
 
 
 @app.get("/api/power")

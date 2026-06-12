@@ -44,6 +44,8 @@ from twin.room_memory import RoomMemory
 DAEMON = "http://localhost:8000"
 BODY_YAW_MAX = 2.7   # rad, mechanical-ish limit used everywhere we command the body
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gestures")
+FACES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "faces")
+FACE_PROFILE_FILE = os.path.join(FACES_DIR, "profiles.json")
 
 # inline action tags the LLM brain may emit ([dance], [gesture:hi], [look:left], ...)
 # Bracket-tolerant: the Gemma-12B fumbles the syntax -- nests the example bracket
@@ -561,6 +563,20 @@ class RobotHub:
             move = self._get_emotion_move("curious1") if self.behaviors.get("emotions_on_cue") else None
             self._enqueue_say(reply, move)
             return {"brain": self.active, "reply": reply, "view": True}
+        # "learn my face" -> look + enroll;  "who am I?" -> recognize
+        if self.FACE_ENROLL_RX.search(text):
+            self.enroll_face("David")
+            return {"brain": self.active, "reply": "", "face": "enroll"}
+        if self.WHOAMI_RX.search(text):
+            self._think_cue(spoken)
+            try:
+                reply = self.whoami()
+            finally:
+                self._thinking.clear()
+            self._log(self.active, reply)
+            move = self._get_emotion_move("cheerful1") if self.behaviors.get("emotions_on_cue") else None
+            self._enqueue_say(reply, move)
+            return {"brain": self.active, "reply": reply, "face": "whoami"}
         # Fold ordinary conversation into the room timeline (part of "what happened").
         if self.behaviors.get("room_memory"):
             self.room.add("speech", f'heard: "{text[:120]}"')
@@ -1247,6 +1263,117 @@ class RobotHub:
         except Exception:
             pass    # sidecar down/slow -> fall back to Marcus
         return self._marcus_post(prompt, image_b64=base64.b64encode(jpeg_bytes).decode(), timeout=45)
+
+    # ---------- face recognition (learn + greet by sight) ----------
+    # ArcFace embeddings from the vision sidecar; the hub owns named profiles. Same
+    # passive-then-match shape as the voiceprint. Different people are near-orthogonal
+    # (cos ~0.06), so 0.4 is a safe "it's them" gate.
+    FACE_MATCH_GATE = 0.40     # cosine: above this = same person
+    FACE_MIN_DET = 0.60        # ignore low-confidence detections
+    FACE_MIN_AREA = 5000       # ignore tiny/far faces (px^2 in the full frame)
+    FACE_ENROLL_SECONDS = 5.0
+    FACE_ENROLL_SAMPLES = 6
+
+    def _face_embed(self, jpeg_bytes, timeout=20):
+        """POST a frame to the sidecar -> faces (largest-first) or []."""
+        try:
+            url = self.VISION_URL.rstrip("/") + "/face/embed"
+            req = urllib.request.Request(url, data=jpeg_bytes,
+                                         headers={"Content-Type": "application/octet-stream"}, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r).get("faces", [])
+        except Exception:
+            return []
+
+    def _best_face(self, jpeg_bytes):
+        """The largest confident, close-enough face in a frame -> embedding (np) or None."""
+        for fc in self._face_embed(jpeg_bytes):                 # already largest-first
+            if fc.get("det_score", 0) >= self.FACE_MIN_DET and fc.get("area", 0) >= self.FACE_MIN_AREA:
+                return np.asarray(fc["embedding"], dtype=np.float32)
+        return None
+
+    def _faces_load(self):
+        try:
+            with open(FACE_PROFILE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _faces_save(self, profiles):
+        os.makedirs(FACES_DIR, exist_ok=True)
+        tmp = FACE_PROFILE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(profiles, f)
+        os.replace(tmp, FACE_PROFILE_FILE)
+
+    def face_identify(self, emb):
+        """(name, cosine) of the best-matching enrolled face, or (None, best) below the gate."""
+        if emb is None:
+            return None, 0.0
+        best_name, best = None, 0.0
+        for name, p in self._faces_load().items():
+            cos = float(np.dot(emb, np.asarray(p["vector"], dtype=np.float32)))  # both L2-normalized
+            if cos > best:
+                best_name, best = name, cos
+        return (best_name, best) if best >= self.FACE_MATCH_GATE else (None, best)
+
+    def enroll_face(self, name="David"):
+        """Look at the person NOW and learn their face over a few seconds (threaded;
+        speaks guidance). Folds into a running-mean faceprint, like the voiceprint."""
+        name = ((name or "David").strip().title()) or "David"
+
+        def _go():
+            if self.mini is None:
+                return
+            self.say("Okay, look right at me for a second...")
+            shots = []
+            t0 = time.time()
+            while time.time() - t0 < self.FACE_ENROLL_SECONDS and len(shots) < self.FACE_ENROLL_SAMPLES:
+                jpg = self.get_jpeg(quality=85)
+                emb = self._best_face(jpg) if jpg else None
+                if emb is not None:
+                    shots.append(emb)
+                time.sleep(0.5)
+            if not shots:
+                self.say("Hmm, I couldn't get a clear look at your face. Come a little closer and try again?")
+                return
+            mean = np.mean(np.stack(shots), axis=0)
+            mean = mean / (np.linalg.norm(mean) or 1.0)
+            profiles = self._faces_load()
+            prev = profiles.get(name)
+            if prev:                                            # blend with the existing print
+                pv = np.asarray(prev["vector"], dtype=np.float32)
+                pc = int(prev.get("count", 1))
+                blended = (pv * pc + mean * len(shots)) / (pc + len(shots))
+                mean = blended / (np.linalg.norm(blended) or 1.0)
+                count = pc + len(shots)
+            else:
+                count = len(shots)
+            profiles[name] = {"vector": [float(x) for x in mean], "count": int(count)}
+            self._faces_save(profiles)
+            self._log("system", f"face enrolled: {name} ({count} samples)")
+            self.say(f"Got it -- I'll know your face now, {name}.")
+
+        threading.Thread(target=_go, daemon=True).start()
+        return {"enrolling": name}
+
+    def face_profile_status(self):
+        return {n: {"samples": p.get("count", 0)} for n, p in self._faces_load().items()}
+
+    def whoami(self):
+        """Look right now and say who he sees (used by the 'who am I?' voice trigger)."""
+        jpg = self.get_jpeg(quality=85)
+        emb = self._best_face(jpg) if jpg else None
+        if emb is None:
+            return "I don't see a face clearly right now."
+        name, _ = self.face_identify(emb)
+        if name:
+            return f"That's you, {name}!"
+        return "I see someone, but I don't recognize you yet. Say 'learn my face' and I'll remember you."
+
+    # voice triggers: "learn my face" -> enroll; "who am I" -> whoami
+    FACE_ENROLL_RX = re.compile(r"\b(learn|remember|save) my (face|name)\b", re.I)
+    WHOAMI_RX = re.compile(r"\b(who am i|who do you see|do you (know|recognize) (me|who i am)|what'?s my name)\b", re.I)
 
     # Identity for Marcus calls that get SPOKEN ALOUD as Reachy (e.g. room recall),
     # minus the mood/action-tag machinery -- this text isn't parsed for tags, it's
