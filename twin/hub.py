@@ -86,6 +86,9 @@ class RobotHub:
         self._room_last_small = None     # downscaled previous frame for the change gate
         self._room_present = False       # is someone currently in view
         self._room_gone_since = 0.0      # debounce "room emptied"
+        # watch modes: "off" | "window" (hold the aim David set) | "scan" (sweep)
+        self.watch_mode = "off"
+        self._watch_saved = None         # gaze behaviors parked while holding a spot
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
         # gaze controller (single owner of neck/body orientation):
         # turn-to-sound saccades the head fast; the follow layer then walks the body
@@ -467,6 +470,18 @@ class RobotHub:
             move = self._get_emotion_move("attentive1") if self.behaviors.get("emotions_on_cue") else None
             self._enqueue_say(reply, move)
             return {"brain": self.active, "reply": reply, "recall": True}
+        # On-demand live look — "what can you see right now?" (works anytime; if the
+        # vantage is poor he asks to be moved).
+        if self.VIEW_RX.search(text):
+            self._think_cue(spoken)
+            try:
+                reply = self.describe_view()
+            finally:
+                self._thinking.clear()
+            self._log(self.active, reply)
+            move = self._get_emotion_move("curious1") if self.behaviors.get("emotions_on_cue") else None
+            self._enqueue_say(reply, move)
+            return {"brain": self.active, "reply": reply, "view": True}
         # Fold ordinary conversation into the room timeline (part of "what happened").
         if self.behaviors.get("room_memory"):
             self.room.add("speech", f'heard: "{text[:120]}"')
@@ -1192,6 +1207,88 @@ class RobotHub:
         self._log("system", f"room recall narrated ({total} events)")
         return text
 
+    # ---- watch modes + "let him ask to see better" ----
+    VIEW_CHECK_PROMPT = (
+        "You are a robot's eyes judging this view as a vantage point for watching a room or a window. "
+        "If it's clear and useful, reply exactly: OK: <a few words on what you can see>. "
+        "If it's a poor vantage -- blocked, too dark, just a blank wall or floor, nothing to watch -- "
+        "reply exactly: BAD: <short reason>.")
+
+    def _assess_view(self, frame):
+        """Ask Marcus whether the current view is a good place to watch from.
+        Returns (quality 'ok'|'bad', detail)."""
+        try:
+            import cv2
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            b64 = base64.b64encode(buf.tobytes()).decode() if ok else None
+        except Exception:
+            b64 = None
+        if not b64:
+            return "ok", ""
+        from twin.brains import clean_for_speech
+        text = clean_for_speech(self._marcus_post(self.VIEW_CHECK_PROMPT, image_b64=b64, timeout=45)).strip()
+        detail = text.split(":", 1)[1].strip() if ":" in text else text
+        return ("bad", detail) if text.upper().startswith("BAD") else ("ok", detail)
+
+    DESCRIBE_PROMPT = (
+        "You are a small desk robot looking through your camera. In ONE short, natural sentence, "
+        "tell your human what you can see right now. If your view is badly blocked, too dark, or "
+        "useless, instead tell them you can't see well and ask them to move you to a better spot.")
+
+    def describe_view(self):
+        """On-demand: what can you see right now? Self-contained — if the vantage
+        is poor he asks to be moved ('if he wants to see better, let him ask me')."""
+        frame = self._safe_frame()
+        if frame is None:
+            return "I can't get a picture right now -- is my camera awake?"
+        try:
+            import cv2
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            b64 = base64.b64encode(buf.tobytes()).decode() if ok else None
+        except Exception:
+            b64 = None
+        from twin.brains import clean_for_speech
+        text = clean_for_speech(self._marcus_post(self.DESCRIBE_PROMPT, image_b64=b64, timeout=45)) if b64 else ""
+        return text or "I'm having trouble making out my view right now."
+
+    def set_watch(self, mode):
+        """off | window (hold the aim David set + caption it). 'scan' (active room
+        sweep) is added once we can test the motion together."""
+        if mode not in ("off", "window"):
+            if mode == "scan":
+                return {"watch": self.watch_mode, "note": "scan coming soon -- aim me and use Watch Window for now"}
+            mode = "off"
+        if mode == "off":
+            self.watch_mode = "off"
+            if self._watch_saved is not None:        # restore the gaze setup we parked
+                for k, v in self._watch_saved.items():
+                    self.set_behavior(k, v)
+                self._watch_saved = None
+            return {"watch": "off", "behaviors": self.behaviors}
+        # entering window-watch
+        if not self.behaviors.get("room_memory"):
+            self.set_behavior("room_memory", True)   # watching is pointless without capturing
+        if self._watch_saved is None:
+            self._watch_saved = {k: self.behaviors[k] for k in ("turn_to_sound", "face_track", "idle_motion")}
+        for k in ("turn_to_sound", "face_track", "idle_motion"):
+            self.set_behavior(k, False)              # hold the aim -- no autonomous drift
+        self.watch_mode = "window"
+        # check the vantage NOW, while David is right there to adjust it
+        frame = self._safe_frame()
+        quality, detail = self._assess_view(frame) if frame is not None else ("ok", "")
+        if quality == "bad":
+            self.say(f"Hmm, I can't see much from here -- {detail}. Could you turn me toward the window, "
+                     "or somewhere with a clearer view?")
+        else:
+            self.say("Did you point me where you want me looking? Got it -- I'll keep watch here. "
+                     "Ask me what I noticed whenever you like.")
+        return {"watch": self.watch_mode, "behaviors": self.behaviors}
+
+    # "what can you see?" — on-demand live look (distinct from the rolling recall)
+    VIEW_RX = re.compile(
+        r"\b(what (can|do) you see|what'?s in front of you|can you see (ok|okay|alright|anything|clearly)|"
+        r"how'?s your view|are you (able to see|seeing) (ok|okay|anything))\b", re.I)
+
     # ---------- camera + manual jog ----------
     def get_jpeg(self, quality=70, timeout=0.5):
         # bound get_frame() so a stalled/empty camera pipeline can't hang the request
@@ -1476,4 +1573,5 @@ class RobotHub:
             "robot_error": None if self.robot_connected else self.last_error,
             "log": list(self.log)[-40:],
             "room": self.room.state(),
+            "watch": self.watch_mode,
         }

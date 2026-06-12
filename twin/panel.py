@@ -73,6 +73,10 @@ class RoomReq(BaseModel):
     retention_hours: Optional[int] = None
 
 
+class WatchReq(BaseModel):
+    mode: str       # off | window  (scan coming once we can test the sweep together)
+
+
 class JogReq(BaseModel):
     part: str       # pitch | roll | yaw | body | ant
     delta: float    # degrees
@@ -169,6 +173,12 @@ def post_room_recall():
     text = hub.room_recall()
     hub.say(text)
     return {"text": text, **hub.room.state()}
+
+
+@app.post("/api/watch")
+def post_watch(r: WatchReq):
+    """Watch a spot: aim Reachy by hand, then 'window' to hold + caption it."""
+    return hub.set_watch(r.mode)
 
 
 @app.get("/api/snapshot")
