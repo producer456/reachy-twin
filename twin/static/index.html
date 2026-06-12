@@ -125,6 +125,23 @@
       </div>
     </div>
     <div class="grp">
+      <label>Room memory <span id="roomStat" style="color:#888;font-weight:400"></span></label>
+      <div class="behaviors">
+        <button id="bhRoom" class="bh" onclick="toggleBh('room_memory')">Remember the room</button>
+        <button id="bhWatch" class="bh" onclick="toggleWatch()">Watch the window</button>
+      </div>
+      <div class="row" style="margin-top:6px;align-items:center;gap:8px">
+        <button id="missBtn" onclick="whatDidIMiss()">What did I miss?</button>
+        <label style="color:#888;font-size:12px">Keep
+          <select id="roomHrs" onchange="setRetention(this.value)">
+            <option value="1">1h</option><option value="4">4h</option>
+            <option value="8">8h</option><option value="12" selected>12h</option><option value="24">24h</option>
+          </select>
+        </label>
+      </div>
+      <div id="missOut" style="margin-top:6px;color:#cbd; font-size:13px; line-height:1.4"></div>
+    </div>
+    <div class="grp">
       <label>Camera &amp; Move</label>
       <div class="row">
         <button id="camBtn" onclick="toggleCam('/api/snapshot','camBtn','Show robot camera')">Show robot camera</button>
@@ -212,6 +229,13 @@ async function refresh(){
       $('bhEmo').className='bh'+(s.behaviors.emotions_on_cue?' on':'');
       $('bhFace').className='bh'+(s.behaviors.face_track?' on':'');
       $('bhIdle').className='bh'+(s.behaviors.idle_motion?' on':'');
+      $('bhRoom').className='bh'+(s.behaviors.room_memory?' on':'');
+    }
+    $('bhWatch').className='bh'+(s.watch==='window'?' on':'');
+    $('bhWatch').textContent=(s.watch==='window'?'Watching window':'Watch the window');
+    if(s.room){
+      $('roomStat').textContent=s.room.event_count?('· '+s.room.event_count+' noted'):'';
+      if(!hrsTouched){const o=[...$('roomHrs').options].find(x=>+x.value===s.room.retention_hours); if(o)$('roomHrs').value=o.value;}
     }
     $('robotDot').className='dot'+(s.robot==='connected'?' on':' err');
     $('robotWrap').title=s.robot_error||'';
@@ -241,6 +265,16 @@ function showMoves(tab){
 }
 async function playMove(kind,name){ try{ await api('/api/move',{kind,name}); }catch(e){} }
 async function toggleBh(name){ try{ const s=await api('/api/state'); await api('/api/behavior',{name,on:!s.behaviors[name]}); refresh(); }catch(e){} }
+let hrsTouched=false;
+async function toggleWatch(){ try{ const s=await api('/api/state'); await api('/api/watch',{mode:(s.watch==='window'?'off':'window')}); refresh(); }catch(e){} }
+async function setRetention(h){ hrsTouched=true; try{ await api('/api/room',{retention_hours:parseInt(h)}); }catch(e){} }
+async function whatDidIMiss(){
+  const o=$('missOut'); const b=$('missBtn');
+  o.textContent='…'; b.disabled=true;
+  try{ const r=await api('/api/room/recall',{}); o.textContent=r.text||'(nothing)'; }
+  catch(e){ o.textContent='Could not reach Reachy.'; }
+  b.disabled=false; refresh();
+}
 let camTimer=null, camSource=null;
 function toggleCam(source, btnId, showLabel){
   const img=$('cam'); const btn=$(btnId);
