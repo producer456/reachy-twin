@@ -46,7 +46,14 @@ BODY_YAW_MAX = 2.7   # rad, mechanical-ish limit used everywhere we command the 
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gestures")
 
 # inline action tags the LLM brain may emit ([dance], [gesture:hi], [look:left], ...)
-ACTION_RX = re.compile(r"\[(dance|gesture|look)(?::([a-zA-Z0-9_ \-]+))?\]", re.I)
+# Bracket-tolerant: the Gemma-12B fumbles the syntax -- nests the example bracket
+# ([dance:[simplenod]]), adds spaces, or uses ()/{} -- and a tag that doesn't match
+# here gets SPOKEN ALOUD instead of performed. Accept any bracket type, optional
+# inner brackets around the name, and stray spaces.
+ACTION_RX = re.compile(
+    r"[\[\(\{]\s*(dance|gesture|look)\s*"
+    r"(?::\s*[\[\(\{]?\s*([a-zA-Z0-9_ \-]+?)\s*[\]\)\}]?\s*)?"
+    r"[\]\)\}]", re.I)
 LOOK_PRESETS = {"left": (28, 0), "right": (-28, 0), "up": (0, -15), "down": (0, 18), "center": (0, 0)}
 
 

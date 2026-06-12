@@ -96,15 +96,21 @@ MOOD_TO_EMOTION = {
     "thinking": "attentive1", "bored": "boredom1", "neutral": None,
 }
 
+# A bracketed KNOWN mood word, with any bracket type ([happy] (sad} ...) anywhere in
+# the reply. Scoped to the known vocab so real bracketed text is left alone. The 12B
+# doesn't reliably put the tag first or close it correctly; any it emits must be
+# pulled out so it's acted on, never spoken.
+_MOOD_RX = re.compile(r"[\[\(\{]\s*(" + "|".join(MOOD_TO_EMOTION) + r")\s*[\]\)\}]", re.I)
+
 
 def strip_mood(text):
-    """Pull a leading [mood] tag off a reply. Returns (mood|None, spoken_text).
-    Tolerates a mismatched closer (`[playful}` / `[playful)`) -- the Marcus 12B
-    sometimes fumbles the bracket, and a malformed tag must never be spoken aloud."""
-    m = re.match(r"\s*[\[\(\{]([a-zA-Z_]+)[\]\)\}]\s*", text or "")
-    if m:
-        return m.group(1).lower(), text[m.end():].strip()
-    return None, (text or "").strip()
+    """Pull the [mood] body-language tag(s) out of a reply. Returns
+    (mood|None, spoken_text): the FIRST mood drives the emotion move, and EVERY
+    mood tag (leading, stray, or malformed) is removed so none get spoken aloud."""
+    text = text or ""
+    moods = [m.group(1).lower() for m in _MOOD_RX.finditer(text)]
+    clean = re.sub(r"\s{2,}", " ", _MOOD_RX.sub("", text)).strip()
+    return (moods[0] if moods else None), clean
 
 
 class _ChatBrain:
