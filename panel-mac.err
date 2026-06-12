@@ -12940,3 +12940,29 @@ Dropped 3200 samples. This is most likely because downstream can't keep up and i
   warnings.warn('resource_tracker: There appear to be %d '
 objc[84121]: Class AVFFrameReceiver is implemented in both /Users/admin/reachy-twin/.venv/lib/python3.12/site-packages/av/.dylibs/libavdevice.62.3.101.dylib (0x10c6083a8) and /Users/admin/reachy-twin/.venv/lib/python3.12/site-packages/cv2/.dylibs/libavdevice.61.3.100.dylib (0x1186d43a8). This may cause spurious casting failures and mysterious crashes. One of the duplicates must be removed or renamed.
 objc[84121]: Class AVFAudioReceiver is implemented in both /Users/admin/reachy-twin/.venv/lib/python3.12/site-packages/av/.dylibs/libavdevice.62.3.101.dylib (0x10c6083f8) and /Users/admin/reachy-twin/.venv/lib/python3.12/site-packages/cv2/.dylibs/libavdevice.61.3.100.dylib (0x1186d43f8). This may cause spurious casting failures and mysterious crashes. One of the duplicates must be removed or renamed.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 5600 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 6880 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 6560 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 3520 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 3520 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 3840 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 3360 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 5280 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 3840 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 3840 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 4160 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+Warning: gst-core-error-quark: Can't record audio fast enough (13) ../gst-libs/gst/audio/gstaudiobasesrc.c(855): gst_audio_base_src_create (): /GstPipeline:audio_recorder/GstOsxAudioSrc:osxaudiosrc0:
+Dropped 4320 samples. This is most likely because downstream can't keep up and is consuming samples too slowly.
+/Users/admin/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

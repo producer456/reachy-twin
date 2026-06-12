@@ -484,9 +484,16 @@ class RobotHub:
         threading.Thread(target=_go, daemon=True).start()
 
     def _antenna_flutter(self):
-        """Oscillate the antennas while `_thinking` is set, then settle back."""
+        """Oscillate the antennas while `_thinking` is set, then settle back. The HEAD
+        is pinned to where it was when thinking began -- only the antennas move. (Each
+        antennas-only goto_target left the head un-commanded, so it crept backwards
+        over a multi-second think; David: 'the head thing is a bit much'.)"""
         try:
-            base = self._pose["ant"] + self.ANT_REST_DEG
+            from reachy_mini.utils import create_head_pose
+            p = self._pose
+            base = p["ant"] + self.ANT_REST_DEG
+            head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
+            body = np.deg2rad(p["body"])
             t0 = time.time()
             up = True
             while self._thinking.is_set() and time.time() - t0 < 30:   # safety cap
@@ -494,14 +501,16 @@ class RobotHub:
                 up = not up
                 if self._lock.acquire(timeout=0.5):     # skip beats while he speaks
                     try:
-                        self.mini.goto_target(antennas=np.deg2rad([a, a]), duration=0.15)
+                        self.mini.goto_target(head=head, body_yaw=body,
+                                              antennas=np.deg2rad([a, a]), duration=0.15)
                     finally:
                         self._lock.release()
                 time.sleep(0.18)
             for _ in range(10):                          # settle back -- retry through lock contention
                 if self._lock.acquire(timeout=1.0):
                     try:
-                        self.mini.goto_target(antennas=np.deg2rad([base, base]), duration=0.4)
+                        self.mini.goto_target(head=head, body_yaw=body,
+                                              antennas=np.deg2rad([base, base]), duration=0.4)
                         break
                     finally:
                         self._lock.release()
