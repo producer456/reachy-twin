@@ -59,6 +59,19 @@ for text, wa, wc in acases:
     a, c = extract(text)
     check(f"extract {text!r}", a == wa and c == wc, f"got {a} clean={c!r}")
 
+print("== bracketless action directives (12B drops the brackets) ==")
+from twin.hub import RobotHub as _RH
+bcases = [
+    ("nice to meet you. dance:", [("dance", None)], "nice to meet you."),  # David's real leak
+    ("sure dance:simplenod", [("dance", "simplenod")], "sure"),
+    ("here look:left", [("look", "left")], "here"),
+    ("I really love this dance", [], "I really love this dance"),         # prose: untouched
+    ("Let us dance!", [], "Let us dance!"),                                # prose: untouched
+]
+for text, wa, wc in bcases:
+    a, c = _RH._extract_actions(text)
+    check(f"bare-action {text!r}", a == wa and c == wc, f"got {a} clean={c!r}")
+
 print("== combined flow (mood then action, nothing spoken-as-tag) ==")
 for text in ["[playful} Reachy! [dance:[simplenod]]",
              "[happy] sure [gesture:wave] watch",

@@ -54,6 +54,12 @@ ACTION_RX = re.compile(
     r"[\[\(\{]\s*(dance|gesture|look)\s*"
     r"(?::\s*[\[\(\{]?\s*([a-zA-Z0-9_ \-]+?)\s*[\]\)\}]?\s*)?"
     r"[\]\)\}]", re.I)
+# Worse still, the 12B often drops the brackets ENTIRELY ("...nice to meet you. dance:")
+# -- so it both gets spoken AND never performed. Catch the bracketless keyword:NAME form.
+# A colon is REQUIRED, so ordinary prose ("I love this dance") is left untouched; `look`
+# only matches a real direction (or a bare trailing "look:").
+BARE_DG_RX   = re.compile(r"(?<![A-Za-z])(dance|gesture)\s*:\s*([a-z0-9_]*)", re.I)
+BARE_LOOK_RX = re.compile(r"(?<![A-Za-z])(look)\s*:\s*(left|right|up|down|center)?", re.I)
 LOOK_PRESETS = {"left": (28, 0), "right": (-28, 0), "up": (0, -15), "down": (0, 18), "center": (0, 0)}
 
 
@@ -1017,11 +1023,23 @@ class RobotHub:
     # ---------- LLM action tags ----------
     @staticmethod
     def _extract_actions(text):
-        """Pull [dance]/[gesture:NAME]/[look:DIR] tags out of a reply.
-        Returns (actions, clean_text) where actions is [(kind, arg|None), ...]."""
-        actions = [(m.group(1).lower(), (m.group(2) or "").strip().lower() or None)
-                   for m in ACTION_RX.finditer(text or "")]
-        clean = re.sub(r"\s{2,}", " ", ACTION_RX.sub("", text or "")).strip()
+        """Pull dance/gesture/look directives out of a reply, bracketed OR bracketless.
+        Returns (actions, clean_text) where actions is [(kind, arg|None), ...]. Every
+        directive is removed from the spoken text AND captured so it's performed."""
+        text = text or ""
+        actions = []
+        def _add(kind, arg):
+            actions.append((kind.lower(), (arg or "").strip().lower() or None))
+        for m in ACTION_RX.finditer(text):          # bracketed [dance:NAME]
+            _add(m.group(1), m.group(2))
+        text = ACTION_RX.sub(" ", text)
+        for m in BARE_DG_RX.finditer(text):         # bracketless dance:/gesture:NAME
+            _add(m.group(1), m.group(2))
+        text = BARE_DG_RX.sub(" ", text)
+        for m in BARE_LOOK_RX.finditer(text):       # bracketless look:DIR (or trailing look:)
+            _add("look", m.group(2))
+        text = BARE_LOOK_RX.sub(" ", text)
+        clean = re.sub(r"\s+([,.!?;:])", r"\1", re.sub(r"\s{2,}", " ", text)).strip()
         return actions, clean
 
     def _run_actions(self, actions):
