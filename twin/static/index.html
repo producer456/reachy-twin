@@ -129,7 +129,8 @@
       <label>Room memory <span id="roomStat" style="color:#888;font-weight:400"></span></label>
       <div class="behaviors">
         <button id="bhRoom" class="bh" onclick="toggleBh('room_memory')">Remember the room</button>
-        <button id="bhWatch" class="bh" onclick="toggleWatch()">Watch the window</button>
+        <button id="bhWatch" class="bh" onclick="toggleWatch('window')">Watch the window</button>
+        <button id="bhScan" class="bh" onclick="toggleWatch('scan')">Scan the room</button>
       </div>
       <div class="row" style="margin-top:6px;align-items:center;gap:8px">
         <button id="missBtn" onclick="whatDidIMiss()">What did I miss?</button>
@@ -234,6 +235,8 @@ async function refresh(){
     }
     $('bhWatch').className='bh'+(s.watch==='window'?' on':'');
     $('bhWatch').textContent=(s.watch==='window'?'Watching window':'Watch the window');
+    $('bhScan').className='bh'+(s.watch==='scan'?' on':'');
+    $('bhScan').textContent=(s.watch==='scan'?'Scanning room…':'Scan the room');
     if(s.room){
       $('roomStat').textContent=s.room.event_count?('· '+s.room.event_count+' noted'):'';
       if(!hrsTouched){const o=[...$('roomHrs').options].find(x=>+x.value===s.room.retention_hours); if(o)$('roomHrs').value=o.value;}
@@ -267,7 +270,7 @@ function showMoves(tab){
 async function playMove(kind,name){ try{ await api('/api/move',{kind,name}); }catch(e){} }
 async function toggleBh(name){ try{ const s=await api('/api/state'); await api('/api/behavior',{name,on:!s.behaviors[name]}); refresh(); }catch(e){} }
 let hrsTouched=false;
-async function toggleWatch(){ try{ const s=await api('/api/state'); await api('/api/watch',{mode:(s.watch==='window'?'off':'window')}); refresh(); }catch(e){} }
+async function toggleWatch(mode){ try{ const s=await api('/api/state'); await api('/api/watch',{mode:(s.watch===mode?'off':mode)}); refresh(); }catch(e){} }
 async function setRetention(h){ hrsTouched=true; try{ await api('/api/room',{retention_hours:parseInt(h)}); }catch(e){} }
 async function whatDidIMiss(){
   const o=$('missOut'); const b=$('missBtn');

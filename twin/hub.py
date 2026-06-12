@@ -90,6 +90,8 @@ class RobotHub:
         # watch modes: "off" | "window" (hold the aim David set) | "scan" (sweep)
         self.watch_mode = "off"
         self._watch_saved = None         # gaze behaviors parked while holding a spot
+        self._scan_stop = threading.Event()
+        self._scan_thread = None
         self._mac_power_cache = (0.0, None)   # (ts, watts) — powermetrics is ~250ms, cache it
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
         # gaze controller (single owner of neck/body orientation):
@@ -182,6 +184,7 @@ class RobotHub:
     def shutdown(self):
         self._supervisor_stop.set()
         self._behavior_stop.set()
+        self._scan_stop.set()
         self.set_listening(False)
         self._teardown_mini()
 
@@ -1268,27 +1271,75 @@ class RobotHub:
         text = clean_for_speech(self._vision_post(self.DESCRIBE_PROMPT, jpeg, timeout=25)) if jpeg else ""
         return text or "I'm having trouble making out my view right now."
 
+    # scan-room sweep: slow body-yaw arc so the (frame-change-gated) captioner
+    # samples the whole room over a couple of minutes. Conservative range -- well
+    # inside the 90 deg body limit; tune SCAN_ARC_DEG live if Reachy wants more.
+    SCAN_ARC_DEG = 45
+    SCAN_STEPS = 4               # angles per side; full pattern pings across and back
+    SCAN_DWELL_S = 6.0           # hold each angle long enough for a caption to land
+
+    def _scan_positions(self):
+        n = self.SCAN_STEPS
+        step = self.SCAN_ARC_DEG / n
+        across = [round(-self.SCAN_ARC_DEG + step * i, 1) for i in range(2 * n + 1)]  # -arc..+arc
+        return across + across[-2:0:-1]                                                # ..and back
+
+    def _scan_loop(self):
+        positions = self._scan_positions()
+        i = 0
+        while not self._scan_stop.is_set() and self.watch_mode == "scan":
+            # Never drive the head while he's talking/thinking or a human has the
+            # controls -- the sweep yields exactly like every other behavior.
+            if self._speaking.is_set() or self._thinking.is_set() or time.time() < self._manual_until:
+                self._scan_stop.wait(1.0)
+                continue
+            yaw = positions[i % len(positions)]
+            i += 1
+            self._pose["body"] = float(yaw)
+            self._pose["yaw"] = 0.0
+            self._pose["pitch"] = 0.0
+            try:
+                self._apply_pose()                   # no _mark_manual -> this IS the behavior
+            except Exception:
+                pass
+            self._scan_stop.wait(self.SCAN_DWELL_S)
+
+    def _start_scan_thread(self):
+        if self._scan_thread is None or not self._scan_thread.is_alive():
+            self._scan_stop.clear()
+            self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
+            self._scan_thread.start()
+
     def set_watch(self, mode):
-        """off | window (hold the aim David set + caption it). 'scan' (active room
-        sweep) is added once we can test the motion together."""
-        if mode not in ("off", "window"):
-            if mode == "scan":
-                return {"watch": self.watch_mode, "note": "scan coming soon -- aim me and use Watch Window for now"}
+        """off | window (hold the aim David set + caption it) | scan (slow body
+        sweep so the captioner surveys the whole room)."""
+        if mode not in ("off", "window", "scan"):
             mode = "off"
+        # leaving any active mode: stop the sweep + un-park the gaze behaviors
+        if mode != "scan":
+            self._scan_stop.set()
         if mode == "off":
             self.watch_mode = "off"
             if self._watch_saved is not None:        # restore the gaze setup we parked
                 for k, v in self._watch_saved.items():
                     self.set_behavior(k, v)
                 self._watch_saved = None
+            self.center()                            # don't leave him cranked to one side
             return {"watch": "off", "behaviors": self.behaviors}
-        # entering window-watch
+        # entering a watch mode (window or scan)
         if not self.behaviors.get("room_memory"):
             self.set_behavior("room_memory", True)   # watching is pointless without capturing
         if self._watch_saved is None:
             self._watch_saved = {k: self.behaviors[k] for k in ("turn_to_sound", "face_track", "idle_motion")}
         for k in ("turn_to_sound", "face_track", "idle_motion"):
             self.set_behavior(k, False)              # hold the aim -- no autonomous drift
+        if mode == "scan":
+            self.watch_mode = "scan"
+            self._start_scan_thread()
+            self.say("Okay, I'll slowly look around the room and keep track of what I see. "
+                     "Ask me what I noticed whenever you like.")
+            return {"watch": self.watch_mode, "behaviors": self.behaviors}
+        # window: hold exactly where David aimed me
         self.watch_mode = "window"
         # check the vantage NOW, while David is right there to adjust it
         frame = self._safe_frame()
@@ -1449,6 +1500,8 @@ class RobotHub:
         }
         for k in list(self.behaviors):          # stop all autonomous motion
             self.set_behavior(k, False)
+        self._scan_stop.set()                   # and stop the room sweep (it's not a behavior)
+        self.watch_mode = "off"
         if self._listening:                     # stop the mic
             self.set_listening(False)
         self._asleep = True

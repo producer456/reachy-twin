@@ -74,7 +74,7 @@ class RoomReq(BaseModel):
 
 
 class WatchReq(BaseModel):
-    mode: str       # off | window  (scan coming once we can test the sweep together)
+    mode: str       # off | window (hold David's aim) | scan (slow room sweep)
 
 
 class JogReq(BaseModel):
