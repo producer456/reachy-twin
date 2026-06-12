@@ -410,19 +410,68 @@ class RobotHub:
             self._active_ts = time.time()
 
     # ---------- chat ----------
-    THINK_FILLERS = ["Hmm.", "Hm, let me think.", "Mmm.", "Oh!", "Good question."]
-
     def _think_cue(self, spoken):
         """Instant acknowledgment while the brain works: antennas perk up and
-        FLUTTER until the reply is ready (visible 'I'm on it'), plus a short
-        verbal filler when the input came in by voice."""
+        FLUTTER until the reply is ready (visible 'I'm on it'), plus a short cute
+        attentive BEEP -- not a spoken word -- when the input came in by voice."""
         if self.mini is None:
             return
         if spoken:
-            self._enqueue_say(random.choice(self.THINK_FILLERS), None)
+            self._play_beep()
         if not self._thinking.is_set():
             self._thinking.set()
             threading.Thread(target=self._antenna_flutter, daemon=True).start()
+
+    def _beep_bank(self):
+        """A few short, cute, rising 'I'm listening' chirps (R2-D2-ish), built once.
+        16 kHz float32 mono (n,1) -- same format the TTS feeds push_audio_sample."""
+        if getattr(self, "_beep_cache", None) is not None:
+            return self._beep_cache
+
+        def chirp(segments, amp=0.22):
+            ramp = max(1, int(SR * 0.008))                  # 8 ms fades kill clicks
+            parts = []
+            for freq, dur in segments:
+                n = int(SR * dur)
+                t = np.arange(n) / SR
+                env = np.ones(n)
+                env[:ramp] = np.linspace(0, 1, ramp)
+                env[-ramp:] = np.linspace(1, 0, ramp)
+                parts.append(np.sin(2 * np.pi * freq * t) * env)
+            sig = (np.concatenate(parts).astype(np.float32) * amp)
+            return sig.reshape(-1, 1)
+
+        self._beep_cache = [
+            chirp([(784, 0.09), (1175, 0.10)]),             # G5 -> D6
+            chirp([(880, 0.08), (1318, 0.10)]),             # A5 -> E6
+            chirp([(1046, 0.07), (1568, 0.09)]),            # C6 -> G6
+            chirp([(988, 0.09), (740, 0.07), (1175, 0.09)]),# little up-down-up
+        ]
+        return self._beep_cache
+
+    def _play_beep(self):
+        """Play one attentive chirp through the robot speaker, immediately and
+        off-thread so the cue is instant. Holds _speaking so the mic pump discards
+        it (he shouldn't 'hear' his own beep)."""
+        if self.mini is None:
+            return
+        try:
+            beep = random.choice(self._beep_bank())
+        except Exception:
+            return
+
+        def _go():
+            self._speaking.set()
+            try:
+                with self._audio_lock:
+                    self.mini.media.push_audio_sample(beep)
+                time.sleep(len(beep) / SR + 0.05)
+            except Exception:
+                pass
+            finally:
+                self._speaking.clear()
+
+        threading.Thread(target=_go, daemon=True).start()
 
     def _antenna_flutter(self):
         """Oscillate the antennas while `_thinking` is set, then settle back."""
@@ -493,7 +542,7 @@ class RobotHub:
         self._think_cue(spoken)                  # he reacts NOW; the answer follows
         try:
             if not msg.strip():
-                reply = f"{self.active.capitalize()} here. What's up?"
+                reply = "Reachy here. What's up?"   # always Reachy -- the engine is invisible
             else:
                 reply = self.brains[self.active].reply(msg)
         except Exception as e:                   # an API/network error must not 500 the route
@@ -1161,12 +1210,24 @@ class RobotHub:
             pass    # sidecar down/slow -> fall back to Marcus
         return self._marcus_post(prompt, image_b64=base64.b64encode(jpeg_bytes).decode(), timeout=45)
 
-    def _marcus_post(self, message, image_b64=None, timeout=45):
+    # Identity for Marcus calls that get SPOKEN ALOUD as Reachy (e.g. room recall),
+    # minus the mood/action-tag machinery -- this text isn't parsed for tags, it's
+    # read out verbatim, so a leading [happy] would be spoken literally.
+    REACHY_NARRATOR = (
+        "You are Reachy, a small, friendly desk robot, speaking out loud to your human. "
+        "Always refer to yourself as Reachy -- never Marcus or any other name. Keep it warm "
+        "and natural for speech: no markdown, no emoji, no mood tags or stage directions, no lists.")
+
+    def _marcus_post(self, message, image_b64=None, timeout=45, system_override=""):
         """One Marcus /api/chat call (auto_memory off so it never touches David's
-        real memory). Optional image for vision. Returns the cumulative SSE text."""
+        real memory). Optional image for vision. system_override makes Marcus answer
+        AS Reachy (used for spoken narration; left off for raw vision-task prompts).
+        Returns the cumulative SSE text."""
         if not MARCUS_URL:
             return ""
         payload = {"message": message, "auto_memory": False}
+        if system_override:
+            payload["system_override"] = system_override
         if image_b64:
             payload["image_b64"] = image_b64
         req = urllib.request.Request(
@@ -1224,7 +1285,8 @@ class RobotHub:
             "call out who came and went and anything notable, keep it to 2-4 sentences. If it was "
             "mostly quiet, say so. Speak naturally; don't read timestamps literally.\n\nLOG:\n" + timeline)
         from twin.brains import clean_for_speech
-        text = clean_for_speech(self._marcus_post(prompt, timeout=60)) or \
+        text = clean_for_speech(self._marcus_post(prompt, timeout=60,
+                                                  system_override=self.REACHY_NARRATOR)) or \
             "I noticed a few things but I'm having trouble putting them into words right now."
         self._log("system", f"room recall narrated ({total} events)")
         return text

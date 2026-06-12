@@ -38,10 +38,17 @@ def clean_for_speech(t: str) -> str:
 
 MAX_TURNS = 12  # keep the last N turns of history
 
+# Reachy's identity lives HERE, in the robot layer -- one source of truth, applied
+# to whichever engine answers (Claude or Marcus). The user always talks to Reachy;
+# which model runs his mind is an engineering detail the user never sees.
+ROBOT_NAME = "Reachy"
+
 SYSTEM_TMPL = (
-    "You are {name}, the voice and personality living inside a small expressive desktop "
-    "robot called Reachy Mini. You hear through its microphone and speak through its speaker. "
-    "You share this robot body with another AI ({other}); the user picks who to talk to by name. "
+    "You are Reachy, a small, expressive desktop robot (a Reachy Mini). This little robot "
+    "body IS you -- you hear through its microphone, speak through its speaker, and move your "
+    "head and antennas to show how you feel. You have your own warm, quick-witted, slightly "
+    "playful personality. If asked your name or who you are, you are Reachy -- never any other "
+    "name. "
     "Keep replies SHORT and natural for speech: 1-3 sentences, no markdown, no emoji, no lists. "
     "Be warm, quick-witted, and a little playful. "
     "BODY LANGUAGE: begin EVERY reply with ONE mood tag in square brackets so the robot acts out "
@@ -75,6 +82,12 @@ def set_actions_hint(dances, gestures):
 def get_actions_hint():
     return _ACTIONS_HINT
 
+
+def reachy_system() -> str:
+    """The one Reachy identity, current actions baked in. Every brain feeds this to
+    its engine, so Reachy is the same character whether Claude or Marcus is running."""
+    return SYSTEM_TMPL.format(actions=get_actions_hint())
+
 # Mood tag -> emotion move name (from pollen-robotics/reachy-mini-emotions-library)
 MOOD_TO_EMOTION = {
     "happy": "cheerful1", "excited": "enthusiastic1", "curious": "curious1",
@@ -85,8 +98,10 @@ MOOD_TO_EMOTION = {
 
 
 def strip_mood(text):
-    """Pull a leading [mood] tag off a reply. Returns (mood|None, spoken_text)."""
-    m = re.match(r"\s*\[([a-zA-Z_]+)\]\s*", text or "")
+    """Pull a leading [mood] tag off a reply. Returns (mood|None, spoken_text).
+    Tolerates a mismatched closer (`[playful}` / `[playful)`) -- the Marcus 12B
+    sometimes fumbles the bracket, and a malformed tag must never be spoken aloud."""
+    m = re.match(r"\s*[\[\(\{]([a-zA-Z_]+)[\]\)\}]\s*", text or "")
     if m:
         return m.group(1).lower(), text[m.end():].strip()
     return None, (text or "").strip()
@@ -125,7 +140,7 @@ class ClaudeBrain(_ChatBrain):
         msg = self.client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=200,
-            system=SYSTEM_TMPL.format(name=self.name, other=self.other, actions=get_actions_hint()),
+            system=reachy_system(),
             messages=self.history,
         )
         text = "".join(b.text for b in msg.content if b.type == "text").strip()
@@ -171,7 +186,7 @@ class ClaudeCLIBrain(_ChatBrain):
 
     def reply(self, user_text: str) -> str:
         self._remember("user", user_text)
-        system = SYSTEM_TMPL.format(name=self.name, other=self.other, actions=get_actions_hint())
+        system = reachy_system()
         common = ["--system-prompt", system, "--exclude-dynamic-system-prompt-sections"]
         reply = ""
         if self.session_id:
@@ -206,7 +221,10 @@ class MarcusBrain(_ChatBrain):
 
     def reply(self, user_text: str) -> str:
         self._remember("user", user_text)  # Marcus also keeps its own server-side memory
-        body = json.dumps({"message": user_text}).encode()
+        # Send Reachy's identity as a system override: Marcus (the engine) answers AS
+        # Reachy -- same persona, mood + action tags -- instead of as itself.
+        body = json.dumps({"message": user_text,
+                           "system_override": reachy_system()}).encode()
         req = urllib.request.Request(
             self.endpoint, data=body,
             headers={"Content-Type": "application/json"}, method="POST",
