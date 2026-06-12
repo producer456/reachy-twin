@@ -71,7 +71,12 @@ class RobotHub:
         self.stt = STT()
         self.tts = KokoroTTS()
         self.brains, self.voices = build_brains()
-        self.active = "claude"
+        # Marcus is Reachy's RESTING brain (David's call 2026-06-12): it has all
+        # his tools (email/calendar/canvas/reminders) and lives on his own GPU.
+        # "Hey Claude" / the client picker still switches for a session, but
+        # every restart settles back on Marcus. Claude only by fallback when
+        # the Marcus link is down at boot.
+        self.active = "marcus" if "marcus" in self.brains else "claude"
         self.reachy_voice = REACHY_VOICE    # his one voice, independent of the engine
         self.mini = None
         self.last_error = None     # last robot-connect failure (shown in /api/state)
