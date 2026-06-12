@@ -64,8 +64,13 @@ class MoveReq(BaseModel):
 
 
 class BehaviorReq(BaseModel):
-    name: str       # turn_to_sound | face_track | emotions_on_cue
+    name: str       # turn_to_sound | face_track | emotions_on_cue | idle_motion | room_memory
     on: bool
+
+
+class RoomReq(BaseModel):
+    enabled: Optional[bool] = None
+    retention_hours: Optional[int] = None
 
 
 class JogReq(BaseModel):
@@ -141,6 +146,29 @@ def post_move(r: MoveReq):
 @app.post("/api/behavior")
 def post_behavior(r: BehaviorReq):
     return {"behaviors": hub.set_behavior(r.name, r.on)}
+
+
+@app.get("/api/room")
+def get_room():
+    """Room-memory status: on/off, retention, how much it's holding."""
+    return {"enabled": hub.behaviors.get("room_memory", False), **hub.room.state()}
+
+
+@app.post("/api/room")
+def post_room(r: RoomReq):
+    if r.retention_hours is not None:
+        hub.room.set_retention(r.retention_hours)
+    if r.enabled is not None:
+        hub.set_behavior("room_memory", r.enabled)
+    return {"enabled": hub.behaviors.get("room_memory", False), **hub.room.state()}
+
+
+@app.post("/api/room/recall")
+def post_room_recall():
+    """On-demand 'what did I miss?' — narrate + speak the rolling memory."""
+    text = hub.room_recall()
+    hub.say(text)
+    return {"text": text, **hub.room.state()}
 
 
 @app.get("/api/snapshot")

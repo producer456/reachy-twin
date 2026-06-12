@@ -13,6 +13,7 @@ worker thread synthesizes + plays in order, so HTTP callers never wait out the a
 The hub may start with no robot attached (panel retries in the background); every
 method that touches self.mini degrades gracefully until the daemon connects.
 """
+import base64
 import glob
 import json
 import os
@@ -36,6 +37,8 @@ from twin.voice import (
     _rms, _mono, SR, EXIT_WORDS, SPEECH_START, SILENCE_HANG, MIN_CHUNKS,
 )
 from twin.brains import strip_mood, MOOD_TO_EMOTION
+from twin.config import MARCUS_URL
+from twin.room_memory import RoomMemory
 
 DAEMON = "http://localhost:8000"
 BODY_YAW_MAX = 2.7   # rad, mechanical-ish limit used everywhere we command the body
@@ -70,9 +73,19 @@ class RobotHub:
         self._dances = None        # list[str]
         # autonomous behaviors
         self.behaviors = {"turn_to_sound": False, "face_track": False,
-                          "emotions_on_cue": False, "idle_motion": False}
+                          "emotions_on_cue": False, "idle_motion": False,
+                          "room_memory": False}
         self._behavior_stop = threading.Event()
         self._behavior_thread = None
+        # rolling room memory (on-demand recall only); its own slow thread so the
+        # ~seconds-long vision caption never blocks robot control.
+        self.room = RoomMemory()
+        self._room_stop = threading.Event()
+        self._room_thread = None
+        self._room_last_caption = 0.0
+        self._room_last_small = None     # downscaled previous frame for the change gate
+        self._room_present = False       # is someone currently in view
+        self._room_gone_since = 0.0      # debounce "room emptied"
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
         # gaze controller (single owner of neck/body orientation):
         # turn-to-sound saccades the head fast; the follow layer then walks the body
@@ -442,6 +455,21 @@ class RobotHub:
             self.active = brain
         msg = strip_wake(text) if switched else text
         self._log("you", text)
+        # On-demand room recall — "what did I miss?" — bypasses the brain and
+        # narrates the rolling memory instead (only when room memory is on).
+        if self.behaviors.get("room_memory") and self.ROOM_RECALL_RX.search(text):
+            self._think_cue(spoken)
+            try:
+                reply = self.room_recall()
+            finally:
+                self._thinking.clear()
+            self._log(self.active, reply)
+            move = self._get_emotion_move("attentive1") if self.behaviors.get("emotions_on_cue") else None
+            self._enqueue_say(reply, move)
+            return {"brain": self.active, "reply": reply, "recall": True}
+        # Fold ordinary conversation into the room timeline (part of "what happened").
+        if self.behaviors.get("room_memory"):
+            self.room.add("speech", f'heard: "{text[:120]}"')
         self._think_cue(spoken)                  # he reacts NOW; the answer follows
         try:
             if not msg.strip():
@@ -619,7 +647,19 @@ class RobotHub:
             self._behavior_thread.start()
         elif not need_thread:
             self._behavior_stop.set()
+        # the room-memory captioner runs on its own (slow) thread
+        if name == "room_memory":
+            if self.behaviors["room_memory"]:
+                self._start_room_thread()
+            else:
+                self._room_stop.set()
         return self.behaviors
+
+    def _start_room_thread(self):
+        if self._room_thread is None or not self._room_thread.is_alive():
+            self._room_stop.clear()
+            self._room_thread = threading.Thread(target=self._room_loop, daemon=True)
+            self._room_thread.start()
 
     FACE_HOLDS_GAZE_S = 2.5   # eyes own the head this long after seeing a face
 
@@ -987,6 +1027,171 @@ class RobotHub:
             return {"ok": True, "deleted": slug}
         return {"error": f"unknown gesture {name!r}"}
 
+    # ---------- rolling room memory (on-demand recall only) ----------
+    ROOM_TICK_S = 4.0          # how often we check the view for a change
+    ROOM_COOLDOWN = 30.0       # min seconds between vision captions
+    ROOM_CHANGE_THRESH = 8.0   # mean per-pixel delta (0-255) that counts as "changed"
+    ROOM_GONE_DEBOUNCE = 8.0   # seconds of no face before we log "room emptied"
+
+    def _safe_frame(self, timeout=0.5):
+        """Grab a camera frame without ever hanging on a stalled pipeline."""
+        if self.mini is None:
+            return None
+        result = [None]
+
+        def _grab():
+            try:
+                result[0] = self.mini.media.get_frame()
+            except Exception:
+                pass
+        t = threading.Thread(target=_grab, daemon=True)
+        t.start()
+        t.join(timeout)
+        return result[0]
+
+    def _room_loop(self):
+        while not self._room_stop.is_set() and self.behaviors.get("room_memory"):
+            try:
+                self._room_tick()
+            except Exception as e:
+                now = time.time()
+                if now - getattr(self, "_room_err_ts", 0) > 60:
+                    self._room_err_ts = now
+                    self._log("system", f"room-memory tick error (continuing): {e}")
+            self._room_stop.wait(self.ROOM_TICK_S)
+
+    def _room_tick(self):
+        # Stand down while Reachy itself is mid-conversation (it owns voice + GPU).
+        if self._speaking.is_set() or self._thinking.is_set():
+            return
+        frame = self._safe_frame()
+        if frame is None:
+            return
+        now = time.time()
+        self._room_presence(frame, now)                  # cheap face check, every tick
+        if now - self._room_last_caption < self.ROOM_COOLDOWN:
+            return
+        if not self._frame_changed(frame):               # nothing changed -> no GPU spent
+            return
+        if self._marcus_busy():                          # you're talking to Marcus -> yield
+            return
+        caption = self._caption_frame(frame)
+        self._room_last_caption = time.time()            # cooldown from the attempt, even if empty
+        if caption:
+            self.room.add("vision", caption)
+
+    def _frame_changed(self, frame):
+        """Cheap CPU change gate so a still scene never spends a vision call."""
+        try:
+            import cv2
+            small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 36))
+        except Exception:
+            return True
+        prev, self._room_last_small = self._room_last_small, small
+        if prev is None:
+            return True
+        return float(np.mean(np.abs(small.astype(np.int16) - prev.astype(np.int16)))) > self.ROOM_CHANGE_THRESH
+
+    def _room_presence(self, frame, now):
+        """Log who comes and goes from the existing face detector (no GPU)."""
+        try:
+            present = len(self._detect_faces(frame)) > 0
+        except Exception:
+            return
+        if present:
+            self._room_gone_since = 0.0
+            if not self._room_present:
+                self._room_present = True
+                self.room.add("presence", "someone came into view")
+        elif self._room_present:
+            if self._room_gone_since == 0.0:
+                self._room_gone_since = now
+            elif now - self._room_gone_since > self.ROOM_GONE_DEBOUNCE:
+                self._room_present = False
+                self._room_gone_since = 0.0
+                self.room.add("presence", "the room looks empty again")
+
+    def _marcus_busy(self):
+        """Poll Marcus's light /healthz so the captioner yields to ALL of your
+        Marcus traffic (any device), not just Reachy's own chats."""
+        if not MARCUS_URL:
+            return False
+        try:
+            with urllib.request.urlopen(MARCUS_URL.rstrip("/") + "/healthz", timeout=3) as r:
+                return bool(json.load(r).get("busy"))
+        except Exception:
+            return True    # can't reach health -> treat as unavailable, skip the caption
+
+    def _marcus_post(self, message, image_b64=None, timeout=45):
+        """One Marcus /api/chat call (auto_memory off so it never touches David's
+        real memory). Optional image for vision. Returns the cumulative SSE text."""
+        if not MARCUS_URL:
+            return ""
+        payload = {"message": message, "auto_memory": False}
+        if image_b64:
+            payload["image_b64"] = image_b64
+        req = urllib.request.Request(
+            MARCUS_URL.rstrip("/") + "/api/chat", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        text = ""
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        obj = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    if obj.get("done"):
+                        break
+                    if "text" in obj:
+                        text = obj["text"]
+        except Exception:
+            return ""
+        return text
+
+    ROOM_CAPTION_PROMPT = (
+        "You are a robot quietly watching a room. In ONE short sentence (max 12 words), "
+        "say what is happening or notable right now -- people, activity, objects, changes. "
+        "If the view is empty or nothing is happening, reply with exactly: nothing.")
+
+    def _caption_frame(self, frame):
+        try:
+            import cv2
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
+            if not ok:
+                return ""
+            b64 = base64.b64encode(buf.tobytes()).decode()
+        except Exception:
+            return ""
+        text = (self._marcus_post(self.ROOM_CAPTION_PROMPT, image_b64=b64, timeout=45) or "").strip()
+        if not text or text.lower().rstrip(".") == "nothing":
+            return ""
+        return text
+
+    # Recall is ON DEMAND only — the robot never volunteers it.
+    ROOM_RECALL_RX = re.compile(
+        r"\b(what(?:'?d| did| have)? i miss|what happened (?:while|when) i(?:'?m|'?ve| wa)?s? (?:gone|away|out)|"
+        r"catch me up|fill me in|did (?:anything|anyone|something) happen)\b", re.I)
+
+    def room_recall(self):
+        """Narrate the rolling memory (Marcus, regardless of the active brain)."""
+        timeline, _shown, total = self.room.timeline_text()
+        if not timeline:
+            return "It's been quiet -- I haven't noticed anything worth mentioning."
+        prompt = (
+            "Below is a timestamped log of what you (a small desk robot) noticed in the room "
+            "while your human was away. Give a brief, warm spoken catch-up: group similar moments, "
+            "call out who came and went and anything notable, keep it to 2-4 sentences. If it was "
+            "mostly quiet, say so. Speak naturally; don't read timestamps literally.\n\nLOG:\n" + timeline)
+        from twin.brains import clean_for_speech
+        text = clean_for_speech(self._marcus_post(prompt, timeout=60)) or \
+            "I noticed a few things but I'm having trouble putting them into words right now."
+        self._log("system", f"room recall narrated ({total} events)")
+        return text
+
     # ---------- camera + manual jog ----------
     def get_jpeg(self, quality=70, timeout=0.5):
         # bound get_frame() so a stalled/empty camera pipeline can't hang the request
@@ -1270,4 +1475,5 @@ class RobotHub:
             "robot": "connected" if self.robot_connected else "disconnected",
             "robot_error": None if self.robot_connected else self.last_error,
             "log": list(self.log)[-40:],
+            "room": self.room.state(),
         }
