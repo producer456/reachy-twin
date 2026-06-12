@@ -37,7 +37,7 @@ from twin.voice import (
     build_brains, detect_switch, strip_wake, calibrate_floor,
     _rms, _mono, SR, EXIT_WORDS, SPEECH_START, SILENCE_HANG, MIN_CHUNKS,
 )
-from twin.brains import strip_mood, MOOD_TO_EMOTION
+from twin.brains import strip_mood, MOOD_TO_EMOTION, clean_for_speech
 from twin.config import MARCUS_URL, REACHY_VOICE
 from twin.room_memory import RoomMemory
 
@@ -562,6 +562,7 @@ class RobotHub:
             self._thinking.clear()               # stop the flutter; time to talk
         mood, reply = strip_mood(reply)          # pull the brain's [mood] tag off the speech
         actions, reply = self._extract_actions(reply)
+        reply = clean_for_speech(reply)          # safety net: nuke any emote the model invented
         self._log(self.active, reply)
         move = None
         if self.behaviors.get("emotions_on_cue"):

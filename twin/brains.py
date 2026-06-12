@@ -29,10 +29,17 @@ def looks_like_tool_call(t: str) -> bool:
 
 
 def clean_for_speech(t: str) -> str:
-    """Strip Marcus's memory notes + markdown so the TTS doesn't read symbols aloud."""
-    if "💾" in t:                       # drop trailing "_💾 Remembered: ..._" note
+    """Make text safe to speak: drop Marcus memory notes, markdown, and -- the big
+    one -- any leftover EMOTE the model invented. Brackets/asterisks never belong in
+    speech, so we remove whole spans (`*wiggles antennas*`, `[boop]`, `{nod}`),
+    not just the symbols -- otherwise the stage-direction TEXT still gets read aloud.
+    Run this LAST, after mood + action tags have been extracted to drive the body."""
+    if "💾" in t:                          # drop trailing "_💾 Remembered: ..._" note
         t = t.split("💾")[0]
-    t = re.sub(r"[*_`#>]", "", t)        # markdown emphasis/headers
+    t = re.sub(r"\*+[^*]*\*+", " ", t)       # *stage directions* / **bold** -> gone (span, not just *)
+    t = re.sub(r"[\[\{][^\[\]\{\}]*[\]\}]", " ", t)  # [emote] {emote} the tag-parsers didn't claim
+    t = re.sub(r"[*_`#>\[\]\{\}]", "", t)    # any stray markdown / unpaired bracket chars
+    t = re.sub(r"\s+([,.!?;:])", r"\1", t)   # tidy space left before punctuation
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
