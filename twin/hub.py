@@ -38,7 +38,7 @@ from twin.voice import (
     _rms, _mono, SR, EXIT_WORDS, SPEECH_START, SILENCE_HANG, MIN_CHUNKS,
 )
 from twin.brains import strip_mood, MOOD_TO_EMOTION
-from twin.config import MARCUS_URL
+from twin.config import MARCUS_URL, REACHY_VOICE
 from twin.room_memory import RoomMemory
 
 DAEMON = "http://localhost:8000"
@@ -63,6 +63,7 @@ class RobotHub:
         self.tts = KokoroTTS()
         self.brains, self.voices = build_brains()
         self.active = "claude"
+        self.reachy_voice = REACHY_VOICE    # his one voice, independent of the engine
         self.mini = None
         self.last_error = None     # last robot-connect failure (shown in /api/state)
         self._lock = threading.Lock()          # serializes SERVO/motion + camera access
@@ -337,7 +338,9 @@ class RobotHub:
         if self.mini is None:
             self._log("system", "(robot offline -- reply not spoken)")
             return
-        self._speech_q.put((text, move, voice or self.voices.get(self.active, "af_heart")))
+        # One Reachy voice regardless of the active engine -- switching brains must
+        # not change how he sounds. An explicit per-call voice still wins.
+        self._speech_q.put((text, move, voice or self.reachy_voice))
 
     def _enqueue_move(self, move):
         """Queue a motion-only item (plays after any queued speech finishes)."""

@@ -18,6 +18,9 @@ KOKORO_MODEL = str(ROOT / "models" / "kokoro" / "kokoro-v1.0.onnx")
 KOKORO_VOICES = str(ROOT / "models" / "kokoro" / "voices-v1.0.bin")
 CLAUDE_VOICE = os.getenv("CLAUDE_VOICE", "am_michael")   # neutral male
 MARCUS_VOICE = os.getenv("MARCUS_VOICE", "af_heart")     # warm female ("heart")
+# Reachy has ONE voice no matter which engine is thinking -- he's Reachy, not the
+# brain. Defaults to David's cute pick. Engine choice never changes how he sounds.
+REACHY_VOICE = os.getenv("REACHY_VOICE", os.getenv("CLAUDE_VOICE", "bf_lily"))
 
 # STT
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
