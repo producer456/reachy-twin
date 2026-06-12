@@ -577,6 +577,15 @@ class RobotHub:
             move = self._get_emotion_move("cheerful1") if self.behaviors.get("emotions_on_cue") else None
             self._enqueue_say(reply, move)
             return {"brain": self.active, "reply": reply, "face": "whoami"}
+        # "Remind me to X at Y" -> deterministic create, no LLM in the loop.
+        rm = self.REMIND_RX.search(msg)
+        if rm:
+            made = self._create_reminder(rm.group(1))
+            if made:
+                self._log(self.active, made)
+                move = self._get_emotion_move("cheerful1") if self.behaviors.get("emotions_on_cue") else None
+                self._enqueue_say(made, move)
+                return {"brain": self.active, "reply": made, "reminder": True}
         # Fold ordinary conversation into the room timeline (part of "what happened").
         if self.behaviors.get("room_memory"):
             self.room.add("speech", f'heard: "{text[:120]}"')
@@ -585,7 +594,35 @@ class RobotHub:
             if not msg.strip():
                 reply = "Reachy here. What's up?"   # always Reachy -- the engine is invisible
             else:
-                reply = self.brains[self.active].reply(msg)
+                use = self.active
+                dm = self.DATA_QUERY_RX.search(msg)
+                followup = (getattr(self, "_last_data_brain", None) == "marcus"
+                            and self.FOLLOWUP_RX.search(msg))
+                if use != "marcus" and "marcus" in self.brains and (dm or followup):
+                    use = "marcus"        # data question (or its follow-up) -> the brain with the tools
+                if use == "marcus":
+                    rewritten = None
+                    if getattr(self, "_last_topic", "") == "email":
+                        em = self.EMAIL_FOLLOWUP_RX.search(msg)
+                        if em:
+                            n = self._EMAIL_ORD.get((em.group(1) or em.group(2) or "").lower())
+                            raw = self._run_tool("email_read", {"email_id": str(n)}) if n else None
+                            if raw:
+                                # hand the model the actual email -- narrating
+                                # supplied text is the one thing it does reliably
+                                rewritten = ("David asked you to read him this email. Tell him in 2-4 "
+                                             "spoken sentences: the subject, who it's from, and the gist. "
+                                             "Use ONLY this text, invent nothing:\n\n" + raw[:3500])
+                    if rewritten is None and dm:
+                        rewritten = self._data_prefetch(msg)
+                    if rewritten:
+                        msg = rewritten
+                if dm:
+                    kw = dm.group(1).lower()
+                    self._last_topic = ("email" if re.match(r"e-?mail|g-?mail|inbox|unread", kw)
+                                        else kw)
+                reply = self.brains[use].reply(msg)
+                self._last_data_brain = use
         except Exception as e:                   # an API/network error must not 500 the route
             self._log("system", f"brain '{self.active}' error: {e}")
             reply = "Sorry, my brain hiccuped for a second there -- say that again?"
@@ -971,6 +1008,13 @@ class RobotHub:
     FT_PITCH_DOWN_DEG = 25.0   # looking down
     FT_GAIN_YAW = 16.0         # deg of correction for a face at the frame edge
     FT_GAIN_PITCH = 11.0
+    # Smooth-pursuit shaping (David: movements read as jerky; sharp moves are
+    # for justified moments only -- sound saccades and emotion moves keep theirs).
+    FT_EMA = 0.45              # face-center smoothing; kills Haar box jitter
+    FT_STEP_FRAC = 0.6         # fraction of the remaining error corrected per tick
+    FT_STEP_MAX_DEG = 7.0      # cap on any single correction
+    FT_DEAD_IN = 0.11          # start tracking past this normalized offset...
+    FT_DEAD_OUT = 0.05         # ...keep correcting until back inside this (hysteresis)
 
     def _face_track_tick(self):
         now = time.time()
@@ -986,27 +1030,53 @@ class RobotHub:
         faces = self._detect_faces(frame)
         if len(faces) == 0:
             return False
+        prev_seen = self._face_seen_ts
         self._face_seen_ts = now                             # eyes have a target
         self._active_ts = now                                # real activity -> hold off idle motion
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])   # largest face
         cx, cy = x + w // 2, y + h // 2
         H, W = frame.shape[:2]
-        if abs(cx - W / 2) < W * 0.08 and abs(cy - H / 2) < H * 0.08:
-            return True                              # already centered -> hold
+        # EMA the face center across ticks -- the Haar box wobbles a few px even
+        # on a perfectly still face, and chasing that wobble reads as twitching.
+        if now - prev_seen < 1.0 and getattr(self, "_ft_c", None):
+            a = self.FT_EMA
+            cx = a * self._ft_c[0] + (1 - a) * cx
+            cy = a * self._ft_c[1] + (1 - a) * cy
+        self._ft_c = (cx, cy)
+        nx = (cx - W / 2) / (W / 2)                  # -1..1, + = face right of center
+        ny = (cy - H / 2) / (H / 2)                  # + = face below center
+        # Hysteresis: engage past DEAD_IN, then pursue until back inside DEAD_OUT,
+        # so he doesn't oscillate at the deadband edge.
+        off = max(abs(nx), abs(ny))
+        if not getattr(self, "_ft_active", False):
+            if off < self.FT_DEAD_IN:
+                return True                          # close enough -> hold still
+            self._ft_active = True
+        elif off < self.FT_DEAD_OUT:
+            self._ft_active = False
+            return True
         _, head_yaw, head_pitch = self._read_pose()
         if head_yaw is None:
             return False
-        dx = (cx - W / 2) / (W / 2)                  # -1..1, + = face right of center
-        dy = (cy - H / 2) / (H / 2)                  # + = face below center
+        # Pursue: a fraction of the error per tick, hard-capped -- never a snap.
+        cap = self.FT_STEP_MAX_DEG
+        d_yaw = max(-cap, min(cap, -nx * self.FT_GAIN_YAW * self.FT_STEP_FRAC))
+        d_pitch = max(-cap, min(cap, ny * self.FT_GAIN_PITCH * self.FT_STEP_FRAC))
+        if abs(d_yaw) < 0.8 and abs(d_pitch) < 0.8:
+            return True                              # sub-degree twitch -> skip
         new_yaw = max(-self.FT_YAW_MAX_DEG, min(self.FT_YAW_MAX_DEG,
-                      float(np.rad2deg(head_yaw)) - dx * self.FT_GAIN_YAW))
+                      float(np.rad2deg(head_yaw)) + d_yaw))
         new_pitch = max(self.FT_PITCH_UP_DEG, min(self.FT_PITCH_DOWN_DEG,
-                        float(np.rad2deg(head_pitch)) + dy * self.FT_GAIN_PITCH))
+                        float(np.rad2deg(head_pitch)) + d_pitch))
         from reachy_mini.utils import create_head_pose
         pose = create_head_pose(yaw=new_yaw, pitch=new_pitch, degrees=True)
+        # Duration scales with step size and overlaps the next tick, so motion
+        # blends into continuous pursuit instead of jolt-stop-jolt.
+        step = max(abs(d_yaw), abs(d_pitch))
+        dur = min(0.8, max(0.4, step / 10.0))
         with self._lock:
             try:
-                self.mini.goto_target(head=pose, duration=0.3)
+                self.mini.goto_target(head=pose, duration=dur)
             except Exception:
                 pass
         return True
@@ -1375,6 +1445,114 @@ class RobotHub:
     FACE_ENROLL_RX = re.compile(r"\b(learn|remember|save) my (face|name)\b", re.I)
     WHOAMI_RX = re.compile(r"\b(who am i|who do you see|do you (know|recognize) (me|who i am)|what'?s my name)\b", re.I)
 
+    # Personal-data and live-info questions are answered by Marcus regardless of
+    # the active brain: only Marcus has the email/calendar/canvas/reminder/
+    # location/web-search tools. Without the detour the default Claude brain
+    # either truthfully refuses ("I can't reach your Gmail") or worse, fakes it
+    # (claimed "Done!" creating a reminder it can't create; invented a 90°F
+    # forecast on a 69°F day). One-turn detour -- the active brain is unchanged.
+    DATA_QUERY_RX = re.compile(
+        r"\b(e-?mails?|g-?mail|inbox|unread|calendar|schedule|appointments?|"
+        r"assignments?|canvas|deadlines?|due|remind(?:ers?)?|grades?|"
+        r"where (?:am|was) i|location|workouts?|weather|forecast|news|headlines?)\b", re.I)
+
+    # Short anaphoric follow-ups ("read the first one") carry none of the data
+    # keywords, so they'd bounce back to the Claude brain mid-thread. If the
+    # PREVIOUS turn was detoured to Marcus, these stay with Marcus too.
+    FOLLOWUP_RX = re.compile(
+        r"^(?:and |what about |how about )|\b(?:that one|this one|"
+        r"the (?:first|second|third|last|newest|oldest) one|"
+        r"read (?:it|that|them)|open (?:it|that)|tell me more|more details?|"
+        r"summari[sz]e (?:it|that)|what (?:does|did) (?:it|that) say)\b", re.I)
+
+    # Ordinal email follow-ups ("read the first one") get REWRITTEN into an
+    # explicit tool instruction: left to itself the 12B narrates an invented
+    # email (a fake Indeed job, a fake Slack thread) rather than fetching one.
+    EMAIL_FOLLOWUP_RX = re.compile(
+        r"\b(?:read|open|show|summari[sz]e)\b.*?\b(first|second|third|fourth|fifth|newest|latest|top|last)\b"
+        r"|\bwhat about the (first|second|third|fourth|fifth|next)\b", re.I)
+    _EMAIL_ORD = {"first": 1, "newest": 1, "latest": 1, "top": 1, "last": 1,
+                  "second": 2, "third": 3, "fourth": 4, "fifth": 5}
+
+    # "Remind me to X at Y" is created DETERMINISTICALLY via the reminders API:
+    # the 12B mangles clock times (asked 8 PM -> set 7:00 -> spoke "6:03"), so
+    # no LLM touches the time. The spoken confirmation echoes the SERVER's
+    # parsed result. Phrases the API can't parse fall through to the brain.
+    REMIND_RX = re.compile(r"\bremind me\b(?: to| that| about)?\s+(.+)$", re.I)
+    TIME_TAIL_RX = re.compile(
+        r"\s+(?:(?:at|by|around)\s+(?:\d|noon|midnight)|tonight|tomorrow|today|"
+        r"this (?:morning|afternoon|evening)|next \w+|"
+        r"in \d+\s*(?:min|minute|hour|hr|day|week)\w*|on \w+day).*$", re.I)
+
+    def _run_tool(self, name, args):
+        """Run a whitelisted READ tool on Marcus directly (POST /api/tool).
+        Deterministic fetch -- the LLM only narrates the returned text."""
+        if not MARCUS_URL:
+            return None
+        body = json.dumps({"name": name, "args": args}).encode()
+        req = urllib.request.Request(
+            MARCUS_URL.rstrip("/") + "/api/tool", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out = json.loads(r.read().decode())
+            return out.get("result") if out.get("ok") else None
+        except Exception:
+            return None
+
+    def _data_prefetch(self, msg):
+        """Deterministically fetch the data for a recognized query shape and
+        return narrate-only instructions, or None to let the brain decide.
+        Every shape this catches is one less chance for the 12B to invent a
+        UCSF job alert that doesn't exist."""
+        low = msg.lower()
+        tool = args = what = None
+        if re.search(r"\b(e-?mails?|g-?mail|inbox|unread)\b", low):
+            unread = bool(re.search(r"\b(unread|new)\b", low))
+            tool, args = "email_recent", {"count": 5, "unread_only": unread}
+            what = "his latest emails"
+        elif re.search(r"\b(calendar|schedule|appointments?)\b", low):
+            days = 30
+            if re.search(r"\btoday\b", low): days = 1
+            elif re.search(r"\btomorrow\b", low): days = 2
+            elif re.search(r"\bweek\b", low): days = 7
+            tool, args = "calendar_upcoming", {"days_ahead": days}
+            what = "his calendar"
+        elif re.search(r"\b(assignments?|canvas|deadlines?|due)\b", low):
+            tool, args, what = "canvas_upcoming", {"days_ahead": 14}, "his Canvas assignments"
+        elif re.search(r"\breminders?\b", low) and not re.search(r"\bremind me\b", low):
+            tool, args, what = "reminder_list", {}, "his reminders"
+        elif re.search(r"\b(weather|forecast)\b", low):
+            tool, args, what = "web_search", {"query": msg}, "the weather"
+        if not tool:
+            return None
+        raw = self._run_tool(tool, args)
+        if not raw:
+            return None
+        return (f"David asked: \"{msg}\" — here is {what}, freshly fetched. Answer his "
+                f"question from ONLY this data, in 1-3 spoken sentences; invent nothing; "
+                f"if it's empty say so:\n\n" + raw[:3500])
+
+    def _create_reminder(self, phrase):
+        """Returns the spoken confirmation, or None to fall through to the brain."""
+        if not MARCUS_URL:
+            return None
+        phrase = phrase.strip().rstrip(".!?")
+        text = self.TIME_TAIL_RX.sub("", phrase).strip(" ,.") or phrase
+        body = json.dumps({"text": text, "when": phrase}).encode()
+        req = urllib.request.Request(
+            MARCUS_URL.rstrip("/") + "/api/reminders", data=body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                out = json.loads(r.read().decode())
+        except Exception:
+            return None
+        rem = out.get("reminder") or {}
+        if not (out.get("ok") and rem.get("when")):
+            return None
+        return f"Got it -- {rem.get('text', text)}, {rem['when']}."
+
     # Identity for Marcus calls that get SPOKEN ALOUD as Reachy (e.g. room recall),
     # minus the mood/action-tag machinery -- this text isn't parsed for tags, it's
     # read out verbatim, so a leading [happy] would be spoken literally.
@@ -1616,10 +1794,25 @@ class RobotHub:
         p = self._pose
         head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
         ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
+        # Travel time scales with distance: a 30-deg [look:left] glance should
+        # glide (~0.9s), not snap in 0.35s like a tiny nudge. Streamed iPad
+        # tracking sends small deltas, so those stay at the fast base time.
+        dist = 0.0
+        try:
+            b, yw, pt = self._read_pose()
+            if yw is not None:
+                dist = max(dist, abs(p["yaw"] - float(np.rad2deg(yw))))
+            if pt is not None:
+                dist = max(dist, abs(p["pitch"] - float(np.rad2deg(pt))))
+            if b is not None:
+                dist = max(dist, abs(p["body"] - float(np.rad2deg(b))))
+        except Exception:
+            pass
+        dur = min(1.1, 0.35 + dist / 55.0)
         try:
             with self._lock:
                 mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
-                                 antennas=ant, duration=0.35)
+                                 antennas=ant, duration=dur)
         except Exception as e:                 # link dropped mid-move -> don't 500 the endpoint
             self._log("system", f"apply_pose failed (link?): {e}")
         return dict(self._pose)

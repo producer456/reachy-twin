@@ -18,14 +18,29 @@ from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MARCUS_URL
 
 
 def looks_like_tool_call(t: str) -> bool:
-    """Marcus sometimes streams a raw tool-call dict (e.g. {"tool":"searchMessages",...})
-    that his web UI would execute. We can't run his tools, so detect + replace it.
-    Streaming can clip the opening brace and curl the quotes, so match the shape
-    ('tool' key near the start + an args key) rather than requiring valid JSON."""
+    """Marcus sometimes leaks a raw tool-call dict (e.g. {"tool":"searchMessages",...})
+    instead of executing it server-side. Detect it so the caller can retry.
+    Streaming can clip the opening brace, curl the quotes, and space-corrupt the
+    key ('"too l": "calendaru pcoming"'), and the fragment can appear mid-text
+    after apology words -- so match the shape anywhere, not just at the start."""
     s = (t or "").strip().lower()
     if s.startswith("{") and "tool" in s and "arg" in s:
         return True
-    return bool(re.match(r'^[\s{\'"“”]*tool[\'"“”\s]*[:=]', s)) and "arg" in s
+    if re.match(r'^[\s{\'"“”]*tool[\'"“”\s]*[:=]', s) and "arg" in s:
+        return True
+    # mid-text leak: a quote/brace, then 'tool' possibly space-corrupted, then :/=
+    return bool(re.search(r'[{\'"“”]\s*t\s*o\s*o\s*l\s*[\'"“”]?\s*[:=]', s))
+
+
+_PROMISE_RX = re.compile(
+    r"\b(let me (?:see|check|look)|i'?ll (?:check|look|see|find)|one (?:sec|second|moment))\b"
+    r"[^.!?]*[.!…]?\s*$", re.I)
+
+
+def sounds_unfinished(t: str) -> bool:
+    """A reply that ENDS on a promise ('Let me see what's due...') with no data
+    after it means the model fumbled a tool call mid-thought. Worth one retry."""
+    return bool(_PROMISE_RX.search((t or "").strip()[-100:]))
 
 
 def clean_for_speech(t: str) -> str:
@@ -232,11 +247,13 @@ class MarcusBrain(_ChatBrain):
             raise RuntimeError("MARCUS_URL not set -- add it to .env")
         self.endpoint = self.url + "/api/chat"
 
-    def reply(self, user_text: str) -> str:
-        self._remember("user", user_text)  # Marcus also keeps its own server-side memory
+    def _ask_marcus(self, user_text: str) -> str:
         # Send Reachy's identity as a system override: Marcus (the engine) answers AS
         # Reachy -- same persona, mood + action tags -- instead of as itself.
+        # History rides along so follow-ups ("read the first one") keep their
+        # referent -- without it every turn was stateless.
         body = json.dumps({"message": user_text,
+                           "history": self.history[:-1],
                            "system_override": reachy_system()}).encode()
         req = urllib.request.Request(
             self.endpoint, data=body,
@@ -259,8 +276,17 @@ class MarcusBrain(_ChatBrain):
                         text = obj["text"]             # cumulative -> keep latest
         except Exception as e:
             text = f"I can't reach Marcus right now: {e}"
+        return text
+
+    def reply(self, user_text: str) -> str:
+        self._remember("user", user_text)  # Marcus also keeps its own server-side memory
+        text = ""
+        for _ in range(2):                 # one silent retry on a fumbled tool call
+            text = self._ask_marcus(user_text)
+            if not looks_like_tool_call(text) and not sounds_unfinished(text):
+                break
         if looks_like_tool_call(text):
-            text = "That one needs me to dig through my memory, which I can't do from in here yet. Ask me something else?"
+            text = "I fumbled that lookup -- mind asking me one more time?"
         text = clean_for_speech(text) or "Hm, I got nothing back."
         self._remember("assistant", text)
         return text
