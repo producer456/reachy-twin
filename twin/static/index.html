@@ -94,6 +94,7 @@
     <span><span id="micDot" class="dot"></span>mic</span>
     <span id="vol">vol —</span>
     <span id="sleepBadge" style="display:none">💤</span>
+    <span id="power" title="Total system power" style="color:#8aa">⚡ —</span>
   </div>
 </header>
 <main>
@@ -310,7 +311,17 @@ async function pollServos(){
     }).join('');
   }catch(e){}
 }
+async function pollPower(){
+  try{
+    const p=await api('/api/power'); const el=$('power');
+    if(p.total_w==null){ el.textContent='⚡ —'; return; }
+    const parts=[]; if(p.mac_w!=null)parts.push('Mac '+p.mac_w); if(p.vr2_w!=null)parts.push('vr-2 '+p.vr2_w);
+    el.textContent='⚡ '+p.total_w+'W'+(parts.length?' ('+parts.join(' · ')+')':'');
+    el.title='Total system power'+(p.mac_available?'':' — Mac not metered yet (run the powermetrics sudoers line)')+(p.vr2&&p.vr2.cost_per_month!=null?' · vr-2 ~$'+p.vr2.cost_per_month+'/mo':'');
+  }catch(e){}
+}
 setInterval(refresh,1500); refresh(); loadMoves();
+setInterval(pollPower,5000); pollPower();
 </script>
 </body>
 </html>

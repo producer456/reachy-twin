@@ -90,6 +90,7 @@ class RobotHub:
         # watch modes: "off" | "window" (hold the aim David set) | "scan" (sweep)
         self.watch_mode = "off"
         self._watch_saved = None         # gaze behaviors parked while holding a spot
+        self._mac_power_cache = (0.0, None)   # (ts, watts) — powermetrics is ~250ms, cache it
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
         # gaze controller (single owner of neck/body orientation):
         # turn-to-sound saccades the head fast; the follow layer then walks the body
@@ -1576,6 +1577,55 @@ class RobotHub:
             self._vol_refreshing = False
 
     # ---------- state for the panel ----------
+    # ---------- power monitoring ----------
+    def mac_power_w(self):
+        """This Mac's SoC compute power (CPU+GPU+ANE) in watts via powermetrics.
+        Needs the NOPASSWD sudoers entry for /usr/bin/powermetrics. Cached ~3s
+        (each sample is ~250ms). Returns None if unavailable (sudoers not set)."""
+        now = time.time()
+        ts, val = self._mac_power_cache
+        if now - ts < 3:
+            return val
+        watts = None
+        try:
+            out = subprocess.run(
+                ["sudo", "-n", "/usr/bin/powermetrics", "--samplers", "cpu_power", "-n", "1", "-i", "200"],
+                capture_output=True, text=True, timeout=6).stdout
+            m = re.search(r"Combined Power \(CPU \+ GPU \+ ANE\):\s*([\d.]+)\s*mW", out)
+            if m:
+                watts = round(float(m.group(1)) / 1000.0, 1)
+            else:                                  # older format: sum the components
+                cpu = re.search(r"CPU Power:\s*([\d.]+)\s*mW", out)
+                gpu = re.search(r"GPU Power:\s*([\d.]+)\s*mW", out)
+                if cpu or gpu:
+                    watts = round(((float(cpu.group(1)) if cpu else 0)
+                                   + (float(gpu.group(1)) if gpu else 0)) / 1000.0, 1)
+        except Exception:
+            watts = None
+        self._mac_power_cache = (now, watts)
+        return watts
+
+    def power_report(self):
+        """Total-system power: this Mac host + Marcus's vr-2 monitor, combined."""
+        mac_w = self.mac_power_w()
+        vr2 = None
+        try:
+            with urllib.request.urlopen(MARCUS_URL.rstrip("/") + "/api/power", timeout=4) as r:
+                vr2 = json.load(r)
+        except Exception:
+            pass
+        vr2_w = vr2.get("live_w") if isinstance(vr2, dict) else None
+        total = None
+        if mac_w is not None or vr2_w is not None:
+            total = round((mac_w or 0) + (vr2_w or 0), 1)
+        return {
+            "mac_w": mac_w,
+            "mac_available": mac_w is not None,    # False until the sudoers entry is added
+            "vr2_w": vr2_w,
+            "vr2": vr2,                            # full vr-2 report (kWh, cost, etc.)
+            "total_w": total,
+        }
+
     def state(self):
         return {
             "active": self.active,

@@ -181,6 +181,12 @@ def post_watch(r: WatchReq):
     return hub.set_watch(r.mode)
 
 
+@app.get("/api/power")
+def get_power():
+    """Total-system power: this Mac host (powermetrics) + Marcus's vr-2 monitor."""
+    return hub.power_report()
+
+
 @app.get("/api/snapshot")
 def snapshot():
     jpg = hub.get_jpeg()
