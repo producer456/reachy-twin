@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import deque
 
@@ -1137,6 +1138,25 @@ class RobotHub:
         except Exception:
             return True    # can't reach health -> treat as unavailable, skip the caption
 
+    # Local Mac vision sidecar (small VLM on the host's Apple-Silicon GPU) — keeps
+    # room captioning OFF Marcus's GPU on vr-2. Falls back to Marcus if it's down.
+    VISION_URL = os.environ.get("VISION_URL", "http://127.0.0.1:8600")
+
+    def _vision_post(self, prompt, jpeg_bytes, timeout=25):
+        """Caption/describe an image. Local sidecar first (fast, no Marcus GPU),
+        Marcus vision as the fallback."""
+        try:
+            url = self.VISION_URL.rstrip("/") + "/describe?prompt=" + urllib.parse.quote(prompt)
+            req = urllib.request.Request(url, data=jpeg_bytes,
+                                         headers={"Content-Type": "application/octet-stream"}, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                text = (json.load(r).get("text") or "").strip()
+                if text:
+                    return text
+        except Exception:
+            pass    # sidecar down/slow -> fall back to Marcus
+        return self._marcus_post(prompt, image_b64=base64.b64encode(jpeg_bytes).decode(), timeout=45)
+
     def _marcus_post(self, message, image_b64=None, timeout=45):
         """One Marcus /api/chat call (auto_memory off so it never touches David's
         real memory). Optional image for vision. Returns the cumulative SSE text."""
@@ -1167,21 +1187,19 @@ class RobotHub:
             return ""
         return text
 
-    ROOM_CAPTION_PROMPT = (
-        "You are a robot quietly watching a room. In ONE short sentence (max 12 words), "
-        "say what is happening or notable right now -- people, activity, objects, changes. "
-        "If the view is empty or nothing is happening, reply with exactly: nothing.")
+    ROOM_CAPTION_PROMPT = ("In one short sentence, describe what is happening in this room right now "
+                           "-- people, activity, objects, anything notable.")
 
     def _caption_frame(self, frame):
         try:
             import cv2
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if not ok:
                 return ""
-            b64 = base64.b64encode(buf.tobytes()).decode()
+            jpeg = buf.tobytes()
         except Exception:
             return ""
-        text = (self._marcus_post(self.ROOM_CAPTION_PROMPT, image_b64=b64, timeout=45) or "").strip()
+        text = (self._vision_post(self.ROOM_CAPTION_PROMPT, jpeg, timeout=25) or "").strip()
         if not text or text.lower().rstrip(".") == "nothing":
             return ""
         return text
@@ -1219,21 +1237,19 @@ class RobotHub:
         Returns (quality 'ok'|'bad', detail)."""
         try:
             import cv2
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            b64 = base64.b64encode(buf.tobytes()).decode() if ok else None
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            jpeg = buf.tobytes() if ok else None
         except Exception:
-            b64 = None
-        if not b64:
+            jpeg = None
+        if not jpeg:
             return "ok", ""
         from twin.brains import clean_for_speech
-        text = clean_for_speech(self._marcus_post(self.VIEW_CHECK_PROMPT, image_b64=b64, timeout=45)).strip()
+        text = clean_for_speech(self._vision_post(self.VIEW_CHECK_PROMPT, jpeg, timeout=25)).strip()
         detail = text.split(":", 1)[1].strip() if ":" in text else text
         return ("bad", detail) if text.upper().startswith("BAD") else ("ok", detail)
 
-    DESCRIBE_PROMPT = (
-        "You are a small desk robot looking through your camera. In ONE short, natural sentence, "
-        "tell your human what you can see right now. If your view is badly blocked, too dark, or "
-        "useless, instead tell them you can't see well and ask them to move you to a better spot.")
+    DESCRIBE_PROMPT = ("You are a small desk robot looking through your camera. In ONE short, "
+                       "natural sentence, tell your human what you can see right now.")
 
     def describe_view(self):
         """On-demand: what can you see right now? Self-contained — if the vantage
@@ -1243,12 +1259,12 @@ class RobotHub:
             return "I can't get a picture right now -- is my camera awake?"
         try:
             import cv2
-            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            b64 = base64.b64encode(buf.tobytes()).decode() if ok else None
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            jpeg = buf.tobytes() if ok else None
         except Exception:
-            b64 = None
+            jpeg = None
         from twin.brains import clean_for_speech
-        text = clean_for_speech(self._marcus_post(self.DESCRIBE_PROMPT, image_b64=b64, timeout=45)) if b64 else ""
+        text = clean_for_speech(self._vision_post(self.DESCRIBE_PROMPT, jpeg, timeout=25)) if jpeg else ""
         return text or "I'm having trouble making out my view right now."
 
     def set_watch(self, mode):
