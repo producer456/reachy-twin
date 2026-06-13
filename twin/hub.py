@@ -726,6 +726,14 @@ class RobotHub:
     VOICE_GATE_ON_RX = re.compile(r"\bonly (listen|respond|reply) to me\b", re.I)
     VOICE_GATE_OFF_RX = re.compile(r"\b(listen|respond|reply) to (everyone|everybody|anyone)\b", re.I)
 
+    # Whisper invents these from noise/near-silence; replying to them is Reachy
+    # talking to nobody ("Thanks." -> a spoken Canvas nudge, witnessed live).
+    STT_HALLUCINATIONS = {
+        "thanks", "thank you", "thanks for watching", "thank you for watching",
+        "you", "bye", "okay", "so", "yeah", "um", "uh", "the", "oh",
+        "you're welcome", "please subscribe", "like and subscribe",
+    }
+
     def _mic_loop(self):
         while not self._stop.is_set():
             try:
@@ -734,6 +742,8 @@ class RobotHub:
                     continue
                 text = self.stt.transcribe(audio)
                 if not text or len(text) < 2:
+                    continue
+                if text.strip(" .!?,").lower() in self.STT_HALLUCINATIONS:
                     continue
                 # Mode toggles are checked BEFORE the gate, so David can always
                 # turn it off by voice — but only if it's actually him.
