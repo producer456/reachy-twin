@@ -209,7 +209,7 @@ class RobotHub:
         self._supervisor_stop.set()
         self._behavior_stop.set()
         self._scan_stop.set()
-        self.set_listening(False)
+        self.set_listening(False, persist=False)   # process exit ≠ David's choice
         self._teardown_mini()
 
     @property
@@ -900,24 +900,34 @@ class RobotHub:
             pass
 
     def _restore_behavior_state(self):
+        # Every step is fenced: one failure here used to silently abort the
+        # rest of boot (listening never started, no log line, robot looked
+        # connected) — the worst kind of deaf.
         try:
             saved = json.loads(self._BEHAVIOR_STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             saved = {}
         for k in self._PERSISTED_BEHAVIORS:
             if saved.get(k):
-                self.set_behavior(k, True)
+                try:
+                    self.set_behavior(k, True)
+                except Exception as e:
+                    self._log("system", f"restore {k} failed: {e}")
         # Listening is the RESTING state of a desk robot (default ON, survives
         # restarts). Before this, every deploy silently went deaf and David
         # stood there repeating "hey Reachy" at a robot that wasn't listening.
         self._desired_listening = bool(saved.get("listening", True))
         if self._desired_listening:
-            self.set_listening(True, persist=False)
+            try:
+                got = self.set_listening(True, persist=False)
+                self._log("system", f"restore: listening -> {got}")
+            except Exception as e:
+                self._log("system", f"restore listening failed: {e}")
 
-    def set_behavior(self, name, on):
+    def set_behavior(self, name, on, persist=True):
         if name in self.behaviors:
             self.behaviors[name] = bool(on)
-            if name in self._PERSISTED_BEHAVIORS:
+            if persist and name in self._PERSISTED_BEHAVIORS:
                 self._save_behavior_state()
         need_thread = (self.behaviors["turn_to_sound"] or self.behaviors["face_track"]
                        or self.behaviors["idle_motion"])
@@ -2081,11 +2091,13 @@ class RobotHub:
             "pose": dict(self._pose),
         }
         for k in list(self.behaviors):          # stop all autonomous motion
-            self.set_behavior(k, False)
+            # persist=False: sleep PARKS the behaviors; it must not overwrite
+            # David's saved opt-ins (wake/_restore bring them back)
+            self.set_behavior(k, False, persist=False)
         self._scan_stop.set()                   # and stop the room sweep (it's not a behavior)
         self.watch_mode = "off"
         if self._listening:                     # stop the mic
-            self.set_listening(False)
+            self.set_listening(False, persist=False)
         self._asleep = True
         # Play the "going to sleep" emotion so his head settles gracefully into a
         # rest pose, and HOLD it (motors stay on) -- cutting the motors made the
