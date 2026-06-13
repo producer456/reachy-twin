@@ -32,15 +32,24 @@ def looks_like_tool_call(t: str) -> bool:
     return bool(re.search(r'[{\'"“”]\s*t\s*o\s*o\s*l\s*[\'"“”]?\s*[:=]', s))
 
 
+# Only a promise left HANGING (no terminal . ! ? — or a trailing ellipsis) is a
+# fumbled tool call. Requiring the unfinished ending stops farewells like "I'll
+# see you tomorrow!" / "I'll check in later." from triggering a duplicate
+# server turn (which re-runs tools + auto-memory and discards the good reply).
+# 'i'll see/find' dropped from the alternation — too common in farewells.
 _PROMISE_RX = re.compile(
-    r"\b(let me (?:see|check|look)|i'?ll (?:check|look|see|find)|one (?:sec|second|moment))\b"
-    r"[^.!?]*[.!…]?\s*$", re.I)
+    r"\b(let me (?:see|check|look)|i'?ll (?:check|look)|one (?:sec|second|moment))\b"
+    r"[^.!?]*(?:\.{3}|…)?\s*$", re.I)
 
 
 def sounds_unfinished(t: str) -> bool:
-    """A reply that ENDS on a promise ('Let me see what's due...') with no data
-    after it means the model fumbled a tool call mid-thought. Worth one retry."""
-    return bool(_PROMISE_RX.search((t or "").strip()[-100:]))
+    """A reply that ENDS on a hanging promise ('Let me see what's due') with no
+    data after it means the model fumbled a tool call mid-thought. Worth one
+    retry. A promise that ends in real punctuation is just normal speech."""
+    tail = (t or "").strip()[-100:]
+    if tail.endswith((".", "!", "?")) and not tail.endswith(("...", "…")):
+        return False
+    return bool(_PROMISE_RX.search(tail))
 
 
 def clean_for_speech(t: str) -> str:
@@ -297,6 +306,11 @@ class MarcusBrain(_ChatBrain):
                 break
         if looks_like_tool_call(text):
             text = "I fumbled that lookup -- mind asking me one more time?"
-        text = clean_for_speech(text) or "Hm, I got nothing back."
+        text = (text or "").strip() or "Hm, I got nothing back."
+        # Return text WITH its [mood]/[dance]/[look] tags intact: the hub runs
+        # strip_mood -> _extract_actions -> clean_for_speech in order (hub.chat).
+        # Cleaning here first deleted the tags, so Marcus-driven Reachy never
+        # performed the model's chosen emotion or dance. Storing the tagged turn
+        # in history also keeps teaching the 12B to lead with a mood tag.
         self._remember("assistant", text)
         return text

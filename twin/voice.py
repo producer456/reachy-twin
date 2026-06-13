@@ -45,8 +45,12 @@ def detect_switch(text, current):
 
 
 def strip_wake(text):
-    """Drop a leading 'hey <name>,' / '<name>,' so the brain doesn't hear its own name."""
-    t = re.sub(r"^\s*(hey|hi|ok|okay)?\s*(marcus|claude)[\s,.:!-]*", "", text, count=1, flags=re.I)
+    """Drop a leading 'hey <name>,' / '<name>,' so the brain doesn't hear its own
+    name. Allows punctuation after the greeting — Whisper writes 'Hey, Marcus,
+    what's up' with a comma after 'Hey', which the old whitespace-only pattern
+    missed, leaking the engine name into the prompt (-> 'Actually, I'm Reachy')."""
+    t = re.sub(r"^\s*(?:hey|hi|ok|okay)?[\s,.!-]*(?:marcus|claude)\b[\s,.:!-]*",
+               "", text, count=1, flags=re.I)
     return t.strip()
 
 
