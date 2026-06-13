@@ -220,9 +220,11 @@ function setActiveBadge(b){
   $('bClaude').className=(b==='claude'?'sel claude':'');
   $('bMarcus').className=(b==='marcus'?'sel marcus':'');
 }
+let lastState={behaviors:{},watch:'off',listening:false};
 async function refresh(){
   try{
     const s=await api('/api/state');
+    lastState=s;                 // toggles flip against this, no read-then-write race
     setActiveBadge(s.active);
     $('micDot').className='dot'+(s.listening?' on':'');
     $('micBtn').className='mic'+(s.listening?' on':''); $('micBtn').textContent=s.listening?'Stop listening':'Start listening';
@@ -254,7 +256,7 @@ async function send(){
   await api('/api/chat',{text:t}); refresh();
 }
 async function setBrain(b){ await api('/api/brain',{brain:b}); refresh(); }
-async function toggleMic(){ const s=await api('/api/state'); await api('/api/listen',{on:!s.listening}); refresh(); }
+async function toggleMic(){ const want=!lastState.listening; lastState.listening=want; await api('/api/listen',{on:want}); refresh(); }
 async function setVol(v){ await api('/api/volume',{volume:parseInt(v)}); }
 let MOVES={emotions:[],dances:[]}, moveTab='emotions';
 async function loadMoves(){ try{ MOVES=await api('/api/moves'); showMoves(moveTab); }catch(e){} }
@@ -270,9 +272,9 @@ function showMoves(tab){
   }
 }
 async function playMove(kind,name){ try{ await api('/api/move',{kind,name}); }catch(e){} }
-async function toggleBh(name){ try{ const s=await api('/api/state'); await api('/api/behavior',{name,on:!s.behaviors[name]}); refresh(); }catch(e){} }
+async function toggleBh(name){ try{ const want=!(lastState.behaviors||{})[name]; (lastState.behaviors=lastState.behaviors||{})[name]=want; await api('/api/behavior',{name,on:want}); refresh(); }catch(e){} }
 let hrsTouched=false;
-async function toggleWatch(mode){ try{ const s=await api('/api/state'); await api('/api/watch',{mode:(s.watch===mode?'off':mode)}); refresh(); }catch(e){} }
+async function toggleWatch(mode){ try{ const want=(lastState.watch===mode?'off':mode); lastState.watch=want; await api('/api/watch',{mode:want}); refresh(); }catch(e){} }
 async function setRetention(h){ hrsTouched=true; try{ await api('/api/room',{retention_hours:parseInt(h)}); }catch(e){} }
 async function whatDidIMiss(){
   const o=$('missOut'); const b=$('missBtn');
