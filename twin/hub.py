@@ -679,11 +679,14 @@ class RobotHub:
 
     # ---------- speaker gate (only-respond-to-David mode) ----------
     def _is_david(self, audio_16k: "np.ndarray") -> bool:
-        """Ask Marcus's voiceprint whether this utterance is David. FAIL-OPEN:
-        any error (network, profile missing, clip too short) returns True so a
+        return self._voice_match(audio_16k)[0]
+
+    def _voice_match(self, audio_16k: "np.ndarray"):
+        """(is_david, match) from Marcus's voiceprint. FAIL-OPEN: any error
+        (network, profile missing, clip too short) returns (True, None) so a
         hiccup can never lock David out of his own robot."""
         if not MARCUS_URL:
-            return True
+            return True, None
         try:
             import io
             import wave
@@ -702,7 +705,7 @@ class RobotHub:
             verdict = out.get("is_david")
             match = out.get("match")
             if verdict is None:        # no profile yet / clip too short -> don't gate
-                return True
+                return True, None
             if not verdict and isinstance(match, (int, float)) and match >= 0.70:
                 # Borderline voice (David's clipped utterances land 0.76-0.83 on
                 # the robot mic): corroborate by SIGHT. If the camera recognizes
@@ -715,13 +718,13 @@ class RobotHub:
                     if name:
                         self._log("system",
                                   f"voice-id borderline ({match}) + face={name} ({cos:.2f}) -> accepted")
-                        return True
+                        return True, match
                 except Exception:
                     pass
             self._log("system", f"voice-id match={match} david={verdict}")
-            return bool(verdict)
+            return bool(verdict), match
         except Exception:
-            return True
+            return True, None
 
     VOICE_GATE_ON_RX = re.compile(r"\bonly (listen|respond|reply) to me\b", re.I)
     VOICE_GATE_OFF_RX = re.compile(r"\b(listen|respond|reply) to (everyone|everybody|anyone)\b", re.I)
@@ -754,16 +757,24 @@ class RobotHub:
                     else:
                         self.say("That's not the voice I answer to for that.")
                     continue
-                if self.behaviors.get("only_david") and not self._is_david(audio):
-                    self._log("system", f'voice gate: ignored non-David utterance "{text[:48]}"')
-                    if "reachy" in text.lower() and self.behaviors.get("emotions_on_cue"):
-                        # addressed by name: show he HEARD without engaging, so a
-                        # rejected David isn't left talking to a statue
-                        try:
-                            self.play("emotion", "confused1")
-                        except Exception:
-                            pass
-                    continue
+                if self.behaviors.get("only_david"):
+                    ok, match = self._voice_match(audio)
+                    # Identity-ESTABLISHING commands get a relaxed bar (0.70):
+                    # "learn my face" must never be blocked by the gate it's
+                    # meant to strengthen (witnessed live at 0.83 — chicken & egg).
+                    if not ok and self.FACE_ENROLL_RX.search(text) \
+                            and isinstance(match, (int, float)) and match >= 0.70:
+                        ok = True
+                    if not ok:
+                        self._log("system", f'voice gate: ignored non-David utterance "{text[:48]}"')
+                        if "reachy" in text.lower() and self.behaviors.get("emotions_on_cue"):
+                            # addressed by name: show he HEARD without engaging, so
+                            # a rejected David isn't left talking to a statue
+                            try:
+                                self.play("emotion", "confused1")
+                            except Exception:
+                                pass
+                        continue
                 if self.VOICE_GATE_OFF_RX.search(text):
                     self.set_behavior("only_david", False)
                     self.say("Okay -- I'll listen to everyone again.")
@@ -1584,7 +1595,7 @@ class RobotHub:
         return "I see someone, but I don't recognize you yet. Say 'learn my face' and I'll remember you."
 
     # voice triggers: "learn my face" -> enroll; "who am I" -> whoami
-    FACE_ENROLL_RX = re.compile(r"\b(learn|remember|save) my (face|name)\b", re.I)
+    FACE_ENROLL_RX = re.compile(r"\b(learn|remember|save|look at) my (face|name)\b", re.I)
     WHOAMI_RX = re.compile(r"\b(who am i|who do you see|do you (know|recognize) (me|who i am)|what'?s my name)\b", re.I)
 
     # Personal-data and live-info questions are answered by Marcus regardless of
