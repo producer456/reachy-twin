@@ -656,8 +656,11 @@ class RobotHub:
         return self.active
 
     # ---------- listening ----------
-    def set_listening(self, on):
+    def set_listening(self, on, persist=True):
         on = bool(on)
+        if persist:                       # explicit choice (app/panel) -> remember it
+            self._desired_listening = on
+            self._save_behavior_state()
         if on and not self._listening:
             self._stop.set()                     # stop + join any straggler loop first
             if self._thread is not None and self._thread.is_alive():
@@ -697,9 +700,25 @@ class RobotHub:
             with urllib.request.urlopen(req, timeout=10) as r:
                 out = json.loads(r.read().decode())
             verdict = out.get("is_david")
+            match = out.get("match")
             if verdict is None:        # no profile yet / clip too short -> don't gate
                 return True
-            self._log("system", f"voice-id match={out.get('match')} david={verdict}")
+            if not verdict and isinstance(match, (int, float)) and match >= 0.70:
+                # Borderline voice (David's clipped utterances land 0.76-0.83 on
+                # the robot mic): corroborate by SIGHT. If the camera recognizes
+                # his enrolled face right now, accept. No-op until a face is
+                # enrolled ("learn my face").
+                try:
+                    jpg = self.get_jpeg(quality=80)
+                    emb = self._best_face(jpg) if jpg else None
+                    name, cos = self.face_identify(emb)
+                    if name:
+                        self._log("system",
+                                  f"voice-id borderline ({match}) + face={name} ({cos:.2f}) -> accepted")
+                        return True
+                except Exception:
+                    pass
+            self._log("system", f"voice-id match={match} david={verdict}")
             return bool(verdict)
         except Exception:
             return True
@@ -727,12 +746,23 @@ class RobotHub:
                     continue
                 if self.behaviors.get("only_david") and not self._is_david(audio):
                     self._log("system", f'voice gate: ignored non-David utterance "{text[:48]}"')
+                    if "reachy" in text.lower() and self.behaviors.get("emotions_on_cue"):
+                        # addressed by name: show he HEARD without engaging, so a
+                        # rejected David isn't left talking to a statue
+                        try:
+                            self.play("emotion", "confused1")
+                        except Exception:
+                            pass
                     continue
                 if self.VOICE_GATE_OFF_RX.search(text):
                     self.set_behavior("only_david", False)
                     self.say("Okay -- I'll listen to everyone again.")
                     continue
-                if any(w in text.lower() for w in EXIT_WORDS):
+                # Exit words only count as a COMMAND when the utterance is
+                # essentially just the command — "tell Phil goodbye for me"
+                # must not silently kill listening (session-only off either
+                # way; listening returns on the next restart).
+                if len(text) <= 32 and any(w in text.lower() for w in EXIT_WORDS):
                     self.say("Okay, going quiet. Bye.")
                     self._listening = False
                     self._stop.set()
@@ -849,7 +879,9 @@ class RobotHub:
 
     def _save_behavior_state(self):
         try:
-            blob = json.dumps({k: self.behaviors.get(k, False) for k in self._PERSISTED_BEHAVIORS})
+            state = {k: self.behaviors.get(k, False) for k in self._PERSISTED_BEHAVIORS}
+            state["listening"] = bool(getattr(self, "_desired_listening", True))
+            blob = json.dumps(state)
             tmp = str(self._BEHAVIOR_STATE_PATH) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(blob)
@@ -861,10 +893,16 @@ class RobotHub:
         try:
             saved = json.loads(self._BEHAVIOR_STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
-            return
+            saved = {}
         for k in self._PERSISTED_BEHAVIORS:
             if saved.get(k):
                 self.set_behavior(k, True)
+        # Listening is the RESTING state of a desk robot (default ON, survives
+        # restarts). Before this, every deploy silently went deaf and David
+        # stood there repeating "hey Reachy" at a robot that wasn't listening.
+        self._desired_listening = bool(saved.get("listening", True))
+        if self._desired_listening:
+            self.set_listening(True, persist=False)
 
     def set_behavior(self, name, on):
         if name in self.behaviors:
