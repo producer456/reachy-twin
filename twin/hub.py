@@ -980,6 +980,7 @@ class RobotHub:
             try:
                 if self.behaviors["face_track"]:
                     self._face_track_tick()
+                    self._ft_relax_tick()  # gaze back down once the face is gone
                 # ears find, eyes hold: sound only steers when no face is in view,
                 # so a noise can't yank his gaze off the person he's looking at.
                 if self.behaviors["turn_to_sound"] and (
@@ -1233,6 +1234,40 @@ class RobotHub:
             except Exception:
                 pass
         return True
+
+    # Gaze relax: David's face is ABOVE a desk robot, so tracking legitimately
+    # pitches the head up — but when he walks away nothing brought it back, so
+    # Reachy ratcheted upward and spent the day staring at the ceiling.
+    FT_RELAX_AFTER = 15.0    # seconds without a face before the gaze settles
+    FT_RELAX_PITCH = -8.0    # only relax when staring up beyond this (neg = up)
+    FT_REST_PITCH = -2.0     # friendly slightly-up resting glance
+
+    def _ft_relax_tick(self):
+        now = time.time()
+        if (now - self._face_seen_ts < self.FT_RELAX_AFTER
+                or now < self._move_until
+                or self._speaking.is_set() or self._thinking.is_set()):
+            return
+        if getattr(self, "_ft_relaxed_at", 0.0) > self._face_seen_ts:
+            return                       # already relaxed since the last sighting
+        _, yaw, pitch = self._read_pose()
+        if pitch is None:
+            return
+        pdeg = float(np.rad2deg(pitch))
+        if pdeg > self.FT_RELAX_PITCH:   # not staring up -> nothing to do
+            self._ft_relaxed_at = now
+            return
+        from reachy_mini.utils import create_head_pose
+        pose = create_head_pose(yaw=float(np.rad2deg(yaw or 0.0)),
+                                pitch=self.FT_REST_PITCH, degrees=True)
+        with self._lock:
+            try:
+                self.mini.goto_target(head=pose, duration=1.4)
+            except Exception:
+                pass
+        self._move_until = now + 1.5
+        self._ft_relaxed_at = now
+        self._log("system", f"gaze relax: pitch {pdeg:.0f} -> {self.FT_REST_PITCH:.0f}")
 
     def _emotion_for(self, text):
         t = text.lower()
