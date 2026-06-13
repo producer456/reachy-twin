@@ -883,11 +883,20 @@ class RobotHub:
                 return {"error": f"unknown kind {kind!r}"}
         except Exception as e:
             return {"error": f"{name}: {e}"}
+        # Mark the performance in-flight so behaviors (face track, sound, idle)
+        # neither queue up behind the motor lock nor yank the head the instant
+        # the move ends.
+        self._move_until = time.time() + 1.0
         try:
             with self._lock:
                 self.mini.play_move(move)
         except Exception as e:
             return {"error": f"{name}: {e}"}
+        finally:
+            # settle grace AFTER the move too (play_move blocks for its whole
+            # duration, so only now do we know when it ended)
+            self._move_until = time.time() + 0.8
+            self._active_ts = time.time()
         self._log("system", f"played {kind}: {name}")
         return {"ok": True, "kind": kind, "name": name}
 
@@ -1174,6 +1183,8 @@ class RobotHub:
         now = time.time()
         if now - self._last_face < 0.25:             # ~4 Hz tracking
             return False
+        if now < self._move_until:                   # a dance/emotion/saccade is
+            return False                             # performing -- don't fight it
         self._last_face = now
         try:
             frame = self.mini.media.get_frame()
@@ -1228,11 +1239,14 @@ class RobotHub:
         # blends into continuous pursuit instead of jolt-stop-jolt.
         step = max(abs(d_yaw), abs(d_pitch))
         dur = min(0.8, max(0.4, step / 10.0))
-        with self._lock:
-            try:
-                self.mini.goto_target(head=pose, duration=dur)
-            except Exception:
-                pass
+        if not self._lock.acquire(timeout=0.2):
+            return False                 # motors busy (dance/speech) -> skip,
+        try:                             # never pile corrections behind the lock
+            self.mini.goto_target(head=pose, duration=dur)
+        except Exception:
+            pass
+        finally:
+            self._lock.release()
         return True
 
     # Gaze relax: David's face is ABOVE a desk robot, so tracking legitimately
