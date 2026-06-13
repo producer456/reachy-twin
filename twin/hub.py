@@ -1548,7 +1548,15 @@ class RobotHub:
         def _go():
             if self.mini is None:
                 return
+            # Re-center FIRST: idle wander can leave the head aimed at the
+            # ceiling, and a 5s enrollment stare at the wall just frustrates
+            # David (witnessed: zero faces in frame for the whole window).
+            try:
+                self.center()
+            except Exception:
+                pass
             self.say("Okay, look right at me for a second...")
+            time.sleep(1.0)               # let the head settle + David lean in
             shots = []
             t0 = time.time()
             while time.time() - t0 < self.FACE_ENROLL_SECONDS and len(shots) < self.FACE_ENROLL_SAMPLES:
