@@ -297,6 +297,17 @@ class RobotHub:
                     if connect_fails >= 2 and self._serial_present() and self._daemon_alive():
                         self._kick_daemon()
                 continue
+            # Listening enforcement: an intermittent boot race can leave the mic
+            # loop unstarted even though David wants it on. The supervisor
+            # converges it instead of us chasing the race — deaf-by-accident is
+            # the one failure mode this robot must never have.
+            if (getattr(self, "_desired_listening", False) and not self._listening
+                    and not self._asleep and self.mini is not None):
+                try:
+                    if self.set_listening(True, persist=False):
+                        self._log("system", "listening enforced on (supervisor)")
+                except Exception:
+                    pass
             # link liveness: cheap joint read; skip the check while he's speaking
             if not self._lock.acquire(timeout=1.5):
                 continue
@@ -786,7 +797,8 @@ class RobotHub:
                 if len(text) <= 32 and any(w in text.lower() for w in EXIT_WORDS):
                     self.say("Okay, going quiet. Bye.")
                     self._listening = False
-                    self._stop.set()
+                    self._desired_listening = False   # session-only: don't let the
+                    self._stop.set()                  # supervisor re-enable the mic
                     break
                 self.chat(text, spoken=True)
             except Exception as e:
@@ -2167,29 +2179,31 @@ class RobotHub:
         if self._listening:                     # stop the mic
             self.set_listening(False, persist=False)
         self._asleep = True
-        # Play the "going to sleep" emotion so his head settles gracefully into a
-        # rest pose, and HOLD it (motors stay on) -- cutting the motors made the
-        # head droop. Falls back to a manual rest pose if the library is missing.
+        # Use the SDK's OFFICIAL power-down (David's pick: the same fold he does
+        # on a daemon reset): re-center, the "pfiou" sound, then tuck into the
+        # shell with antennas down. Ends IN the sleep pose, motors holding.
+        folded = False
         try:
-            self._load_moves()
             with self._lock:
-                self.mini.play_move(self.emotions.get(self.SLEEP_ANIM))
+                self.mini.goto_sleep()
+            folded = True
         except Exception as e:
-            self._log("system", f"sleep anim unavailable: {e}")
-        # The emotion ends back at neutral/alert, so settle him into a held rest
-        # pose (head dipped, antennas down) -- slow + smooth -- so he actually
-        # ENDS looking asleep. Motors stay on, so no droop.
+            self._log("system", f"goto_sleep unavailable ({e}) -- using rest pose")
+        # Park our pose state at the rest pose so jog/center/idle reason from
+        # roughly where he is; only COMMAND it as the fallback (re-commanding
+        # after goto_sleep would undo the official fold).
         self._pose.update(self._SLEEP_POSE)
-        try:
-            from reachy_mini.utils import create_head_pose
-            p = self._pose
-            head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
-            ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
-            with self._lock:
-                self.mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
-                                      antennas=ant, duration=1.5)
-        except Exception:
-            self._apply_pose()
+        if not folded:
+            try:
+                from reachy_mini.utils import create_head_pose
+                p = self._pose
+                head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
+                ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
+                with self._lock:
+                    self.mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
+                                          antennas=ant, duration=1.5)
+            except Exception:
+                self._apply_pose()
         self._log("system", "💤 asleep")
         return {"asleep": True}
 
@@ -2198,13 +2212,19 @@ class RobotHub:
             return {"asleep": False}
         st = self._sleep_state or {}
         self._asleep = False
-        # cute perk-up greeting, then settle back to how he was
+        # SDK's official power-up (pairs with goto_sleep): rise from the folded
+        # pose, "toudoum" sound, little roll flourish. Falls back to the old
+        # perk-up emotion if unavailable.
         try:
-            self._load_moves()
             with self._lock:
-                self.mini.play_move(self.emotions.get(self.WAKE_ANIM))
-        except Exception as e:
-            self._log("system", f"wake anim unavailable: {e}")
+                self.mini.wake_up()
+        except Exception:
+            try:
+                self._load_moves()
+                with self._lock:
+                    self.mini.play_move(self.emotions.get(self.WAKE_ANIM))
+            except Exception as e:
+                self._log("system", f"wake anim unavailable: {e}")
         if "pose" in st:                         # smoothly back to where he was
             self._pose.update(st["pose"])
             self._apply_pose()
