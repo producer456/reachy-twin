@@ -102,7 +102,10 @@ class RobotHub:
         # autonomous behaviors
         self.behaviors = {"turn_to_sound": False, "face_track": False,
                           "emotions_on_cue": False, "idle_motion": False,
-                          "room_memory": False, "only_david": False}
+                          "room_memory": False, "only_david": False,
+                          "wake_word": False,      # mic sleeps until "hey Reachy"
+                          "room_listen": False}    # log overheard speech, never reply
+        self._wakeUntil = 0.0                       # active-listen window end after a wake
         self._behavior_stop = threading.Event()
         self._behavior_thread = None
         # rolling room memory (on-demand recall only); its own slow thread so the
@@ -725,20 +728,11 @@ class RobotHub:
         # revived (the old shared-Event clear() did exactly that on the 2s join
         # timeout -> two loops racing the mic buffer -> garbled hearing + double
         # replies). No join needed: the old loop self-retires on its next check.
-        with self._listen_lock:
-            if on and not self._listening:
-                if self.mini is None:
-                    self._log("system", "(robot offline -- can't listen)")
-                    return False
-                self._mic_gen += 1
-                self._listening = True
-                gen = self._mic_gen
-                self._thread = threading.Thread(
-                    target=self._mic_loop, args=(gen,), daemon=True)
-                self._thread.start()
-            elif not on and self._listening:
-                self._listening = False
-                self._mic_gen += 1               # invalidate the running loop
+        if on and self.mini is None:
+            self._log("system", "(robot offline -- can't listen)")
+            return False                          # supervisor will retry once connected
+        self._listening = on
+        self._sync_mic()                          # starts/stops the loop per _mic_active()
         return self._listening
 
     # ---------- speaker gate (only-respond-to-David mode) ----------
@@ -802,7 +796,7 @@ class RobotHub:
     }
 
     def _mic_loop(self, gen):
-        while self._mic_gen == gen and self._listening:
+        while self._mic_gen == gen and self._mic_active():
             try:
                 audio = self._capture(gen)
                 if audio is None:
@@ -811,6 +805,30 @@ class RobotHub:
                 if not text or len(text) < 2:
                     continue
                 if text.strip(" .!?,").lower() in self.STT_HALLUCINATIONS:
+                    continue
+
+                # Listening modes — decide whether to ACT on this utterance.
+                now = time.time()
+                # Passive room-listening: log overheard speech for "what did I
+                # miss", and (when that's the only mode) never respond.
+                acting = self._listening
+                if self.behaviors.get("wake_word"):
+                    if now < self._wakeUntil:
+                        self._wakeUntil = now + self.WAKE_WINDOW   # refresh the window
+                        acting = True
+                    elif self.REACHY_WAKE.search(text):
+                        self._wakeUntil = now + self.WAKE_WINDOW
+                        self._think_cue(True)                      # beep + perk: "I'm listening"
+                        rest = self.REACHY_WAKE.sub("", text, count=1).strip(" ,.!?-")
+                        if len(rest) < 2:
+                            continue                               # just woke; await the command
+                        text = rest                                # the command after "hey Reachy"
+                        acting = True
+                    else:
+                        acting = False                             # asleep, not addressed
+                if self.behaviors.get("room_listen") and not acting:
+                    self.room.add("speech", f'heard: "{text[:120]}"')
+                if not acting:
                     continue
                 # Mode toggles are checked BEFORE the gate, so David can always
                 # turn it off by voice — but only if it's actually him.
@@ -851,9 +869,9 @@ class RobotHub:
                         and not re.search(r"\b(don'?t|do not|never|won'?t|not|stop)\b", text.lower())):
                     self.say("Okay, going quiet. Bye.")
                     self._listening = False
-                    self._desired_listening = False   # session-only: don't let the
-                    self._mic_gen += 1                # supervisor re-enable the mic
-                    break
+                    self._desired_listening = False   # session-only (not persisted)
+                    self._wakeUntil = 0               # also close any wake window
+                    continue   # loop continues only if wake_word/room_listen keep the mic active
                 self.chat(text, spoken=True)
             except Exception as e:
                 # one STT/capture hiccup must not silently end listening
@@ -886,15 +904,15 @@ class RobotHub:
             if s is None or len(s) == 0:
                 time.sleep(0.005)                # don't spin a core on an idle pipeline
                 continue
-            if self._speaking.is_set() or not self._listening:
-                self._mic_buf.clear()            # discard: his own voice / nobody listening
+            if self._speaking.is_set() or not self._mic_active():
+                self._mic_buf.clear()            # discard: his own voice / mic not capturing
                 continue
             self._mic_buf.append(_mono(s))
 
     def _capture(self, gen=None, max_seconds=15.0):
         buf, in_speech, run, silence = [], False, 0, 0
         start = time.time()
-        while ((gen is None or self._mic_gen == gen) and self._listening
+        while ((gen is None or self._mic_gen == gen) and self._mic_active()
                and time.time() - start < max_seconds):
             if self._speaking.is_set():          # he's talking: drop any half-built
                 buf, in_speech, run, silence = [], False, 0, 0   # utterance, start fresh after
@@ -971,7 +989,32 @@ class RobotHub:
     # User OPT-IN behaviors survive restarts (the always-on quartet is re-forced
     # at every connect, so only these two need remembering). Without this, every
     # code deploy silently turned room memory and the voice gate back off.
-    _PERSISTED_BEHAVIORS = ("room_memory", "only_david")
+    _PERSISTED_BEHAVIORS = ("room_memory", "only_david", "wake_word", "room_listen")
+    WAKE_WINDOW = 25.0      # seconds of active command-listening after "hey Reachy"
+    # Lenient wake phrase: Whisper mangles "Reachy" (reach/reachy/richie/ritchie/
+    # "reach he"), so match the family. Bias to catch it — a miss = he ignores you.
+    REACHY_WAKE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?(reach\w*|rich\w*|ritchie|reachie)\b", re.I)
+
+    def _mic_active(self):
+        """The mic loop runs in ANY capture mode: active listening, wake-word
+        standby, or passive room-listening."""
+        return (self._listening or self.behaviors.get("wake_word", False)
+                or self.behaviors.get("room_listen", False))
+
+    def _sync_mic(self):
+        """Start or stop the single mic loop to match _mic_active(). Serialized;
+        a stale loop self-retires when _mic_gen moves (see set_listening note)."""
+        with self._listen_lock:
+            running = self._thread is not None and self._thread.is_alive()
+            if self._mic_active() and not running:
+                if self.mini is None:
+                    return
+                self._mic_gen += 1
+                gen = self._mic_gen
+                self._thread = threading.Thread(target=self._mic_loop, args=(gen,), daemon=True)
+                self._thread.start()
+            elif not self._mic_active() and running:
+                self._mic_gen += 1   # invalidate -> the loop exits on its next check
     _BEHAVIOR_STATE_PATH = Path(__file__).resolve().parent.parent / "behavior_state.json"
 
     def _save_behavior_state(self):
@@ -1054,6 +1097,10 @@ class RobotHub:
                 self._start_room_thread()
             else:
                 self._room_stop.set()
+        # wake-word + listen-while-away keep the mic loop alive (or release it).
+        if name in ("wake_word", "room_listen"):
+            self._wakeUntil = 0       # toggling wake mode closes any open window
+            self._sync_mic()
         return self.behaviors
 
     def _start_room_thread(self):
@@ -1278,7 +1325,7 @@ class RobotHub:
     # unbounded look_at_image) so tracking can never command a pose where the
     # head rim contacts the shell -- the bump zone is deep pitch at yaw.
     FT_YAW_MAX_DEG = HEAD_YAW_SAFE      # head-only; the follow layer brings the body for more
-    FT_PITCH_UP_DEG = HEAD_PITCH_UP_SAFE    # looking up (negative = up); shell clearance limit
+    FT_PITCH_UP_DEG = -12.0    # tracking won't crane past this (shell-safe is -18; FT stays gentler so he doesn't gawk at the ceiling)
     FT_PITCH_DOWN_DEG = HEAD_PITCH_DOWN_SAFE   # looking down
     FT_GAIN_YAW = 16.0         # deg of correction for a face at the frame edge
     FT_GAIN_PITCH = 11.0
@@ -1363,9 +1410,9 @@ class RobotHub:
     # Gaze relax: David's face is ABOVE a desk robot, so tracking legitimately
     # pitches the head up — but when he walks away nothing brought it back, so
     # Reachy ratcheted upward and spent the day staring at the ceiling.
-    FT_RELAX_AFTER = 15.0    # seconds without a face before the gaze settles
-    FT_RELAX_PITCH = -8.0    # only relax when staring up beyond this (neg = up)
-    FT_REST_PITCH = -2.0     # friendly slightly-up resting glance
+    FT_RELAX_AFTER = 4.0     # settle the gaze quickly once the face is gone
+    FT_RELAX_PITCH = 2.0     # relax whenever he's not already looking slightly down
+    FT_REST_PITCH = 6.0      # rest looking slightly DOWN (toward a standing person), not up
 
     def _ft_relax_tick(self):
         now = time.time()

@@ -124,6 +124,8 @@
         <button id="bhFace" class="bh" onclick="toggleBh('face_track')">Face-track</button>
         <button id="bhIdle" class="bh" onclick="toggleBh('idle_motion')">Idle motion</button>
         <button id="bhOnlyMe" class="bh" onclick="toggleBh('only_david')">Only respond to David</button>
+        <button id="bhWake" class="bh" onclick="toggleBh('wake_word')">Wake word ("Hey Reachy")</button>
+        <button id="bhRoomListen" class="bh" onclick="toggleBh('room_listen')">Listen while away</button>
       </div>
     </div>
     <div class="grp">
@@ -235,6 +237,8 @@ async function refresh(){
       $('bhFace').className='bh'+(s.behaviors.face_track?' on':'');
       $('bhIdle').className='bh'+(s.behaviors.idle_motion?' on':'');
       $('bhOnlyMe').className='bh'+(s.behaviors.only_david?' on':'');
+      $('bhWake').className='bh'+(s.behaviors.wake_word?' on':'');
+      $('bhRoomListen').className='bh'+(s.behaviors.room_listen?' on':'');
       $('bhRoom').className='bh'+(s.behaviors.room_memory?' on':'');
     }
     $('bhWatch').className='bh'+(s.watch==='window'?' on':'');
