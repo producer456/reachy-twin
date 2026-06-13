@@ -556,8 +556,18 @@ class RobotHub:
             from reachy_mini.utils import create_head_pose
             p = self._pose
             base = p["ant"] + self.ANT_REST_DEG
-            head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
-            body = np.deg2rad(p["body"])
+            # Pin the head to where it ACTUALLY is right now (measured), not the
+            # stale _pose: thinking starts the instant David speaks, when
+            # face-track/sound has the head aimed at him via goto_target (which
+            # doesn't write _pose). Using _pose would jerk the head to center.
+            b, hy, hp = self._read_pose()
+            if hy is not None and hp is not None:
+                head = create_head_pose(yaw=float(np.rad2deg(hy)),
+                                        pitch=float(np.rad2deg(hp)), degrees=True)
+                body = b if b is not None else np.deg2rad(p["body"])
+            else:
+                head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
+                body = np.deg2rad(p["body"])
             t0 = time.time()
             up = True
             while self._thinking.is_set() and time.time() - t0 < 30:   # safety cap
@@ -1217,6 +1227,17 @@ class RobotHub:
         if now - self._last_idle < self.IDLE_TICK_S:
             return
         self._last_idle = now
+        # Re-sync the baseline from where he ACTUALLY is first: face-track / sound
+        # / follow drive goto_target without writing _pose, so without this the
+        # idle tick would command a stale _pose and snap the head off the last
+        # tracked position. Easing then starts from his real pose.
+        b, y, p = self._read_pose()
+        if y is not None:
+            self._pose["yaw"] = float(np.rad2deg(y))
+        if p is not None:
+            self._pose["pitch"] = float(np.rad2deg(p))
+        if b is not None:
+            self._pose["body"] = float(np.rad2deg(b))
         # ease the resting baseline back toward neutral (return-to-center when left alone)
         for k in ("yaw", "pitch", "body"):
             self._pose[k] *= (1.0 - self.IDLE_RECENTER)
@@ -1244,12 +1265,21 @@ class RobotHub:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return self._cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
 
+    # Shell-clearance envelope for the HEAD axes — the rim contacts the shell at
+    # deep pitch combined with yaw. SINGLE SOURCE OF TRUTH: face tracking AND
+    # jog/look (_clamp_head) both use these, so a manual nudge can't bump the
+    # head into the case the way the old _JOG_LIMITS (pitch 30 / yaw 60) allowed.
+    HEAD_YAW_SAFE = 38.0       # +-
+    HEAD_PITCH_UP_SAFE = -18.0 # negative = up
+    HEAD_PITCH_DOWN_SAFE = 25.0
+    HEAD_ROLL_SAFE = 18.0      # +-, conservative (deep roll+pitch also bumps)
+
     # Bounded face tracking: we aim the head ourselves (instead of the SDK's
     # unbounded look_at_image) so tracking can never command a pose where the
     # head rim contacts the shell -- the bump zone is deep pitch at yaw.
-    FT_YAW_MAX_DEG = 38.0      # head-only; the follow layer brings the body for more
-    FT_PITCH_UP_DEG = -18.0    # looking up (negative = up); shell clearance limit
-    FT_PITCH_DOWN_DEG = 25.0   # looking down
+    FT_YAW_MAX_DEG = HEAD_YAW_SAFE      # head-only; the follow layer brings the body for more
+    FT_PITCH_UP_DEG = HEAD_PITCH_UP_SAFE    # looking up (negative = up); shell clearance limit
+    FT_PITCH_DOWN_DEG = HEAD_PITCH_DOWN_SAFE   # looking down
     FT_GAIN_YAW = 16.0         # deg of correction for a face at the frame edge
     FT_GAIN_PITCH = 11.0
     # Smooth-pursuit shaping (David: movements read as jerky; sharp moves are
@@ -2127,8 +2157,18 @@ class RobotHub:
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return buf.tobytes() if ok else None
 
-    _JOG_LIMITS = {"pitch": 30, "roll": 30, "yaw": 60, "body": 90, "ant": 90}  # degrees
+    _JOG_LIMITS = {"yaw": HEAD_YAW_SAFE, "body": 90, "ant": 90}  # degrees; pitch/roll clamped asymmetrically
     ANT_REST_DEG = 8   # antennas held at exactly 0 deg hunt (backlash); a small offset stops it
+
+    def _clamp_head(self, part, v):
+        """Clamp a head/body/antenna target to the shell-safe envelope.
+        Pitch is asymmetric ([-18 up, +25 down]); yaw/roll symmetric."""
+        if part == "pitch":
+            return max(self.HEAD_PITCH_UP_SAFE, min(self.HEAD_PITCH_DOWN_SAFE, v))
+        if part == "roll":
+            return max(-self.HEAD_ROLL_SAFE, min(self.HEAD_ROLL_SAFE, v))
+        lim = self._JOG_LIMITS.get(part, self.HEAD_YAW_SAFE)
+        return max(-lim, min(lim, v))
 
     def _apply_pose(self):
         mini = self.mini                       # snapshot: the supervisor may null it mid-call
@@ -2209,8 +2249,8 @@ class RobotHub:
         y, p = float(yaw_deg), float(pitch_deg)
         if not (np.isfinite(y) and np.isfinite(p)):   # reject NaN/inf from a tracker glitch
             return dict(self._pose)
-        self._pose["yaw"] = max(-self._JOG_LIMITS["yaw"], min(self._JOG_LIMITS["yaw"], y))
-        self._pose["pitch"] = max(-self._JOG_LIMITS["pitch"], min(self._JOG_LIMITS["pitch"], p))
+        self._pose["yaw"] = self._clamp_head("yaw", y)        # shell-safe envelope
+        self._pose["pitch"] = self._clamp_head("pitch", p)   # asymmetric [-18, +25]
         # Short hold: the iPad streams look() continuously, so this just keeps the
         # hub's own behaviors from fighting the external tracker while it's active.
         self._mark_manual(hold=1.5)
@@ -2231,8 +2271,7 @@ class RobotHub:
             self._pose["yaw"] = float(np.rad2deg(y))
         elif part == "pitch" and p is not None:
             self._pose["pitch"] = float(np.rad2deg(p))
-        lim = self._JOG_LIMITS[part]
-        self._pose[part] = max(-lim, min(lim, self._pose[part] + d))
+        self._pose[part] = self._clamp_head(part, self._pose[part] + d)  # shell-safe (asymmetric pitch)
         self._mark_manual()
         return self._apply_pose()
 
@@ -2388,9 +2427,13 @@ class RobotHub:
         return True
 
     def set_volume(self, v):
-        self._vol_cache = int(v)            # reflect immediately in the panel
+        try:
+            v = max(0, min(100, int(v)))    # clamp here so EVERY caller is covered
+        except (TypeError, ValueError):
+            return {"error": "bad volume"}
+        self._vol_cache = v                 # reflect immediately in the panel
         self._vol_ts = time.time()
-        body = json.dumps({"volume": int(v)}).encode()
+        body = json.dumps({"volume": v}).encode()
         req = urllib.request.Request(DAEMON + "/api/volume/set", data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
         try:

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import urllib.request
 import uuid
@@ -224,10 +225,24 @@ class ClaudeCLIBrain(_ChatBrain):
     def _run(self, cmd) -> str:
         if self.model:
             cmd = cmd + ["--model", self.model]
+        # start_new_session so the claude CLI (a Node process that spawns its own
+        # children) gets its own process group; on timeout we kill the WHOLE
+        # group, not just the direct child — otherwise grandchildren orphan and
+        # keep burning CPU/network after the 90s deadline.
+        proc = None
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=90)
-            return (r.stdout or "").strip()
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="replace",
+                                    start_new_session=True)
+            out, _ = proc.communicate(timeout=90)
+            return (out or "").strip()
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.communicate(timeout=5)      # reap
+            except Exception:
+                pass
+            return ""
         except Exception:
             return ""
 
