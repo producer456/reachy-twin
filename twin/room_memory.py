@@ -29,21 +29,37 @@ class RoomMemory:
     def _load(self):
         try:
             data = json.loads(self.PATH.read_text(encoding="utf-8"))
+            # Newer format: {"retention_hours": h, "events": [...]}. Restore the
+            # configured retention BEFORE computing the cutoff, or a saved 48h
+            # window gets pruned back to the 12h default on every restart.
+            if isinstance(data, dict):
+                rh = data.get("retention_hours")
+                if isinstance(rh, (int, float)):
+                    self.retention_hours = max(1, min(48, int(rh)))
+                events = data.get("events", [])
+            else:
+                events = data            # legacy: bare list
             cutoff = time.time() - self.retention_hours * 3600
             with self._lock:
-                self._events = [e for e in data if isinstance(e, dict)
+                self._events = [e for e in events if isinstance(e, dict)
                                 and float(e.get("t", 0)) >= cutoff]
         except Exception:
             pass                      # no file yet / unreadable -> start empty
 
     def _save(self):
+        # Hold the lock across the WHOLE write+replace: concurrent adds (room
+        # thread + voice thread) sharing one .tmp path could interleave and let
+        # one replace move a half-written file onto room_events.json, truncating
+        # the entire timeline (the 'recall comes back empty' failure this exists
+        # to prevent). RLock is cheap for a ~1MB blob.
         try:
             with self._lock:
-                blob = json.dumps(self._events)
-            tmp = str(self.PATH) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(blob)
-            os.replace(tmp, self.PATH)
+                blob = json.dumps({"retention_hours": self.retention_hours,
+                                   "events": self._events})
+                tmp = str(self.PATH) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(blob)
+                os.replace(tmp, self.PATH)
         except Exception:
             pass                      # persistence is best-effort
 
@@ -55,6 +71,7 @@ class RoomMemory:
         with self._lock:
             self.retention_hours = max(1, min(48, h))
         self._prune()
+        self._save()                  # a shrink must hit disk now, not on the next add
 
     def add(self, kind, text):
         text = (text or "").strip()
@@ -79,6 +96,13 @@ class RoomMemory:
 
     # ---- read side ----
 
+    @staticmethod
+    def fmt_clock(epoch):
+        """'9:05 AM' portably. The '%-I' no-pad flag is glibc/BSD-only and
+        raises ValueError on CPython/Windows (the documented vr-2 fallback
+        host), which broke recall entirely there."""
+        return time.strftime("%I:%M %p", time.localtime(epoch)).lstrip("0")
+
     def count(self):
         with self._lock:
             return len(self._events)
@@ -100,8 +124,7 @@ class RoomMemory:
             evs = self._events[-max_events:]
         lines = []
         for e in evs:
-            ts = time.strftime("%-I:%M %p", time.localtime(e["t"]))
-            lines.append(f"{ts} - {e['text']}")
+            lines.append(f"{self.fmt_clock(e['t'])} - {e['text']}")
         return "\n".join(lines), len(evs), total
 
     def state(self):

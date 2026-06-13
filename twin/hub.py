@@ -82,14 +82,19 @@ class RobotHub:
         self.last_error = None     # last robot-connect failure (shown in /api/state)
         self._lock = threading.Lock()          # serializes SERVO/motion + camera access
         self._audio_lock = threading.Lock()    # serializes the AUDIO pipeline (speaker/mic), separate from motion
-        self._speaking = threading.Event()      # set while a reply is playing out loud
-        self._connect_lock = threading.Lock()  # supervisor + /api/robot/reconnect must not double-connect
+        self._speaking = threading.Event()      # set while ANY audio is playing out loud
+        self._speaking_n = 0                     # refcount: beep + reply can overlap
+        self._speaking_lock = threading.Lock()   # so one releaser can't clear the other's hold
+        self._connect_lock = threading.RLock()  # supervisor + /api/robot/reconnect must not double-connect; re-entrant so _teardown_mini can be called while held
         # mic ring buffer: the pump is the ONLY reader of the SDK mic; _capture reads here
         self._mic_buf = deque(maxlen=512)      # ~10ms chunks -> a few seconds of backlog max
         self._pump_stop = None                 # per-connection stop event for the mic pump
         self._listening = False
-        self._stop = threading.Event()
+        self._listen_lock = threading.Lock()   # serialize set_listening (off->on race)
+        self._mic_gen = 0                      # generation token: a loop dies when this moves
         self._thread = None
+        self._desired_listening = True         # session intent (exit-words flip this only)
+        self._persist_listening = True         # durable preference written to disk
         self._thresh = 0.02
         self.log = deque(maxlen=100)
         self.emotions = None       # RecordedMoves (lazy)
@@ -114,6 +119,7 @@ class RobotHub:
         self._watch_saved = None         # gaze behaviors parked while holding a spot
         self._scan_stop = threading.Event()
         self._scan_thread = None
+        self._thread_lock = threading.Lock()  # serialize behavior/room/scan (re)starts
         self._mac_power_cache = (0.0, None)   # (ts, watts) — powermetrics is ~250ms, cache it
         self.doa_sign = -1.0       # flip if he turns the wrong way (tuned live)
         # gaze controller (single owner of neck/body orientation):
@@ -197,6 +203,18 @@ class RobotHub:
         # tell the Claude brain what physical actions it can call
         from twin import brains as _brains
         _brains.set_actions_hint(self._dances or [], self.list_gestures())
+        # If the link blipped while he was ASLEEP, don't wake him: re-arming
+        # behaviors + the mic on a 'sleeping' robot would have him face-tracking
+        # and transcribing while the UI shows him asleep, and would stomp the
+        # snapshot wake() restores. Just re-settle the sleep pose and bail.
+        if self._asleep:
+            self._pose.update(self._SLEEP_POSE)
+            try:
+                self._apply_pose()
+            except Exception:
+                pass
+            self._log("system", "reconnected while asleep — staying asleep")
+            return
         # always-on by default: ears find him a face, eyes hold it, moods get acted out
         self.set_behavior("face_track", True)
         self.set_behavior("turn_to_sound", True)
@@ -217,17 +235,22 @@ class RobotHub:
         return self.mini is not None
 
     def _teardown_mini(self):
-        mini, self.mini = self.mini, None
-        if self._pump_stop is not None:
-            self._pump_stop.set()       # the pump dies with its connection
-        if mini is None:
-            return
-        try:
-            mini.media.stop_recording()
-            mini.media.stop_playing()
-            mini.__exit__(None, None, None)
-        except Exception:
-            pass
+        # Serialize with _start_locked: an HTTP reconnect() racing the
+        # supervisor could tear down a connection the other was mid-publish on,
+        # leaking an orphaned mic pump (spinning 10 Hz against a dead link) and
+        # double-__exit__ing one ReachyMini.
+        with self._connect_lock:
+            mini, self.mini = self.mini, None
+            if self._pump_stop is not None:
+                self._pump_stop.set()       # the pump dies with its connection
+            if mini is None:
+                return
+            try:
+                mini.media.stop_recording()
+                mini.media.stop_playing()
+                mini.__exit__(None, None, None)
+            except Exception:
+                pass
 
     # ---------- supervision (auto-reconnect) ----------
     # Owns the robot link end to end: initial connect, reconnect after the robot
@@ -413,7 +436,7 @@ class RobotHub:
         # Speaking uses the AUDIO lock, not the motion lock, so a manual jog (and
         # the emotion move below) can run while he talks instead of freezing for
         # the whole reply. Synthesis is pure CPU -> never under any lock.
-        self._speaking.set()
+        self._speaking_acquire()
         self._active_ts = time.time()
         try:
             mt = None
@@ -443,7 +466,7 @@ class RobotHub:
             if mt is not None:
                 mt.join(timeout=4)
         finally:
-            self._speaking.clear()
+            self._speaking_release()
             self._active_ts = time.time()
 
     # ---------- chat ----------
@@ -486,6 +509,20 @@ class RobotHub:
         ]
         return self._beep_cache
 
+    def _speaking_acquire(self):
+        """Refcounted anti-echo gate. The beep and a queued reply can play at
+        once; a bare Event let whichever finished first clear() the gate out
+        from under the other, reopening the mic mid-reply (-> self-hearing)."""
+        with self._speaking_lock:
+            self._speaking_n += 1
+            self._speaking.set()
+
+    def _speaking_release(self):
+        with self._speaking_lock:
+            self._speaking_n = max(0, self._speaking_n - 1)
+            if self._speaking_n == 0:
+                self._speaking.clear()
+
     def _play_beep(self):
         """Play one attentive chirp through the robot speaker, immediately and
         off-thread so the cue is instant. Holds _speaking so the mic pump discards
@@ -498,7 +535,7 @@ class RobotHub:
             return
 
         def _go():
-            self._speaking.set()
+            self._speaking_acquire()
             try:
                 with self._audio_lock:
                     self.mini.media.push_audio_sample(beep)
@@ -506,7 +543,7 @@ class RobotHub:
             except Exception:
                 pass
             finally:
-                self._speaking.clear()
+                self._speaking_release()
 
         threading.Thread(target=_go, daemon=True).start()
 
@@ -671,21 +708,27 @@ class RobotHub:
         on = bool(on)
         if persist:                       # explicit choice (app/panel) -> remember it
             self._desired_listening = on
+            self._persist_listening = on  # the durable preference, written to disk
             self._save_behavior_state()
-        if on and not self._listening:
-            self._stop.set()                     # stop + join any straggler loop first
-            if self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=2)
-            if self.mini is None:
-                self._log("system", "(robot offline -- can't listen)")
-                return False
-            self._listening = True
-            self._stop.clear()
-            self._thread = threading.Thread(target=self._mic_loop, daemon=True)
-            self._thread.start()
-        elif not on and self._listening:
-            self._listening = False
-            self._stop.set()
+        # Generation token + lock: every (re)start bumps _mic_gen, and a loop
+        # exits the instant its own token is stale. So a stale loop can NEVER be
+        # revived (the old shared-Event clear() did exactly that on the 2s join
+        # timeout -> two loops racing the mic buffer -> garbled hearing + double
+        # replies). No join needed: the old loop self-retires on its next check.
+        with self._listen_lock:
+            if on and not self._listening:
+                if self.mini is None:
+                    self._log("system", "(robot offline -- can't listen)")
+                    return False
+                self._mic_gen += 1
+                self._listening = True
+                gen = self._mic_gen
+                self._thread = threading.Thread(
+                    target=self._mic_loop, args=(gen,), daemon=True)
+                self._thread.start()
+            elif not on and self._listening:
+                self._listening = False
+                self._mic_gen += 1               # invalidate the running loop
         return self._listening
 
     # ---------- speaker gate (only-respond-to-David mode) ----------
@@ -748,10 +791,10 @@ class RobotHub:
         "you're welcome", "please subscribe", "like and subscribe",
     }
 
-    def _mic_loop(self):
-        while not self._stop.is_set():
+    def _mic_loop(self, gen):
+        while self._mic_gen == gen and self._listening:
             try:
-                audio = self._capture()
+                audio = self._capture(gen)
                 if audio is None:
                     continue
                 text = self.stt.transcribe(audio)
@@ -794,11 +837,12 @@ class RobotHub:
                 # essentially just the command — "tell Phil goodbye for me"
                 # must not silently kill listening (session-only off either
                 # way; listening returns on the next restart).
-                if len(text) <= 32 and any(w in text.lower() for w in EXIT_WORDS):
+                if (len(text) <= 32 and any(w in text.lower() for w in EXIT_WORDS)
+                        and not re.search(r"\b(don'?t|do not|never|won'?t|not|stop)\b", text.lower())):
                     self.say("Okay, going quiet. Bye.")
                     self._listening = False
                     self._desired_listening = False   # session-only: don't let the
-                    self._stop.set()                  # supervisor re-enable the mic
+                    self._mic_gen += 1                # supervisor re-enable the mic
                     break
                 self.chat(text, spoken=True)
             except Exception as e:
@@ -837,10 +881,11 @@ class RobotHub:
                 continue
             self._mic_buf.append(_mono(s))
 
-    def _capture(self, max_seconds=15.0):
+    def _capture(self, gen=None, max_seconds=15.0):
         buf, in_speech, run, silence = [], False, 0, 0
         start = time.time()
-        while not self._stop.is_set() and time.time() - start < max_seconds:
+        while ((gen is None or self._mic_gen == gen) and self._listening
+               and time.time() - start < max_seconds):
             if self._speaking.is_set():          # he's talking: drop any half-built
                 buf, in_speech, run, silence = [], False, 0, 0   # utterance, start fresh after
                 time.sleep(0.05)
@@ -922,7 +967,11 @@ class RobotHub:
     def _save_behavior_state(self):
         try:
             state = {k: self.behaviors.get(k, False) for k in self._PERSISTED_BEHAVIORS}
-            state["listening"] = bool(getattr(self, "_desired_listening", True))
+            # The DURABLE preference, not the session value: 'go to sleep'/exit
+            # words flip _desired_listening for the session without persisting,
+            # so an unrelated later save can't write listening:false to disk and
+            # leave him deaf on the next boot.
+            state["listening"] = bool(getattr(self, "_persist_listening", True))
             blob = json.dumps(state)
             tmp = str(self._BEHAVIOR_STATE_PATH) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -939,22 +988,44 @@ class RobotHub:
             saved = json.loads(self._BEHAVIOR_STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             saved = {}
+        # Load the listening preference FIRST: the behavior restores below call
+        # _save_behavior_state, which would otherwise serialize the __init__
+        # default (True) over David's saved choice before we'd read it.
+        self._persist_listening = bool(saved.get("listening", True))
+        self._desired_listening = self._persist_listening
         for k in self._PERSISTED_BEHAVIORS:
             if saved.get(k):
                 try:
-                    self.set_behavior(k, True)
+                    self.set_behavior(k, True, persist=False)
                 except Exception as e:
                     self._log("system", f"restore {k} failed: {e}")
         # Listening is the RESTING state of a desk robot (default ON, survives
         # restarts). Before this, every deploy silently went deaf and David
         # stood there repeating "hey Reachy" at a robot that wasn't listening.
-        self._desired_listening = bool(saved.get("listening", True))
+        # (preference already loaded above; supervisor enforces it if mini
+        # wasn't connected yet at this point.)
         if self._desired_listening:
             try:
                 got = self.set_listening(True, persist=False)
                 self._log("system", f"restore: listening -> {got}")
             except Exception as e:
                 self._log("system", f"restore listening failed: {e}")
+
+    def _ensure_thread(self, attr, stop_event, target):
+        """Start (or restart) a singleton worker thread safely. Serialized by
+        _thread_lock and — crucially — JOINS any existing thread before clearing
+        its stop event, so the old 'check is_alive then clear stop' race can no
+        longer leave the flag enabled with no thread running (or two threads
+        fighting). The loops exit within one wait period once stop is set."""
+        with self._thread_lock:
+            old = getattr(self, attr, None)
+            if old is not None and old.is_alive():
+                stop_event.set()
+                old.join(timeout=3)        # loops poll stop on a <=1s cadence
+            stop_event.clear()
+            t = threading.Thread(target=target, daemon=True)
+            setattr(self, attr, t)
+            t.start()
 
     def set_behavior(self, name, on, persist=True):
         if name in self.behaviors:
@@ -964,9 +1035,7 @@ class RobotHub:
         need_thread = (self.behaviors["turn_to_sound"] or self.behaviors["face_track"]
                        or self.behaviors["idle_motion"])
         if need_thread and (self._behavior_thread is None or not self._behavior_thread.is_alive()):
-            self._behavior_stop.clear()
-            self._behavior_thread = threading.Thread(target=self._behavior_loop, daemon=True)
-            self._behavior_thread.start()
+            self._ensure_thread("_behavior_thread", self._behavior_stop, self._behavior_loop)
         elif not need_thread:
             self._behavior_stop.set()
         # the room-memory captioner runs on its own (slow) thread
@@ -978,10 +1047,7 @@ class RobotHub:
         return self.behaviors
 
     def _start_room_thread(self):
-        if self._room_thread is None or not self._room_thread.is_alive():
-            self._room_stop.clear()
-            self._room_thread = threading.Thread(target=self._room_loop, daemon=True)
-            self._room_thread.start()
+        self._ensure_thread("_room_thread", self._room_stop, self._room_loop)
 
     FACE_HOLDS_GAZE_S = 2.5   # eyes own the head this long after seeing a face
 
@@ -995,6 +1061,9 @@ class RobotHub:
             if self._speaking.is_set():           # let the emotion-move own the body while talking
                 time.sleep(0.1)
                 continue
+            if time.time() < self._move_until:    # a dance/emotion/saccade is performing (+settle
+                time.sleep(0.05)                  # grace): don't block on _lock then fire a stale
+                continue                          # goto the instant it ends (head-yank bug)
             if time.time() < self._manual_until:  # a human just jogged/looked -- don't fight it
                 time.sleep(0.06)
                 continue
@@ -1379,24 +1448,46 @@ class RobotHub:
             return RecordedMove(json.load(f))
 
     def gesture_record_start(self):
-        if self.mini is None:
+        mini = self.mini
+        if mini is None:
             return {"error": "robot not connected"}
         if self._recording_gesture:
             return {"error": "already recording"}
+        # Set the flag only AFTER the SDK calls succeed. If disable_motors/
+        # start_recording raised (or the link dropped mid-call), a flag set
+        # first would stick True forever — freezing every behavior tick and
+        # leaving the motors disabled until a process restart.
+        try:
+            with self._lock:
+                mini.disable_motors()            # limp -> move him by hand
+                mini.start_recording()
+        except Exception as e:
+            try:
+                with self._lock:
+                    mini.enable_motors()         # don't leave him limp on failure
+            except Exception:
+                pass
+            return {"error": f"could not start recording: {e}"}
         self._recording_gesture = True           # behaviors + flutter stand down
-        with self._lock:
-            self.mini.disable_motors()           # limp -> move him by hand
-            self.mini.start_recording()
         self._log("system", "gesture recording -- move him by hand")
         return {"ok": True, "recording": True}
 
     def gesture_record_stop(self, name, save=True):
-        if self.mini is None or not self._recording_gesture:
+        mini = self.mini
+        if not self._recording_gesture:
             return {"error": "not recording"}
-        with self._lock:
-            data = self.mini.stop_recording()
-            self.mini.enable_motors()            # pins targets to present pose (no snap)
-        self._recording_gesture = False
+        # Always clear the flag, even if the SDK call fails or the link is gone —
+        # otherwise the robot is stuck 'recording' (all behaviors frozen) forever.
+        data = None
+        try:
+            if mini is not None:
+                with self._lock:
+                    data = mini.stop_recording()
+                    mini.enable_motors()         # pins targets to present pose (no snap)
+        except Exception as e:
+            self._log("system", f"gesture stop error (clearing anyway): {e}")
+        finally:
+            self._recording_gesture = False
         if not save:
             return {"ok": True, "discarded": True}
         if not data:
@@ -1478,10 +1569,10 @@ class RobotHub:
         self._room_presence(frame, now)                  # cheap face check, every tick
         if now - self._room_last_caption < self.ROOM_COOLDOWN:
             return
-        if not self._frame_changed(frame):               # nothing changed -> no GPU spent
-            return
-        if self._marcus_busy():                          # you're talking to Marcus -> yield
-            return
+        if self._marcus_busy():                          # yield BEFORE consuming the change
+            return                                        # baseline, else a change that happens
+        if not self._frame_changed(frame):               # while busy is absorbed and never
+            return                                        # captioned even after Marcus frees up
         caption = self._caption_frame(frame)
         self._room_last_caption = time.time()            # cooldown from the attempt, even if empty
         if caption:
@@ -1527,7 +1618,11 @@ class RobotHub:
             with urllib.request.urlopen(MARCUS_URL.rstrip("/") + "/healthz", timeout=3) as r:
                 return bool(json.load(r).get("busy"))
         except Exception:
-            return True    # can't reach health -> treat as unavailable, skip the caption
+            # Unreachable Marcus (vr-2 off/asleep — a normal state) cannot be
+            # GPU-contended, and the PRIMARY captioner is the local Mac sidecar.
+            # Failing closed here silently killed all room vision during any
+            # vr-2 outage. No host == no contention -> don't block.
+            return False
 
     # Local Mac vision sidecar (small VLM on the host's Apple-Silicon GPU) — keeps
     # room captioning OFF Marcus's GPU on vr-2. Falls back to Marcus if it's down.
@@ -1879,7 +1974,7 @@ class RobotHub:
         picks.reverse()
         parts = []
         for e in picks:
-            ts = time.strftime("%-I:%M", time.localtime(e["t"]))
+            ts = self.room.fmt_clock(e["t"])     # portable (%-I is glibc-only -> Windows crash)
             parts.append(f"around {ts}, {e['text'].rstrip('.')}")
         span_h = (evs[-1]["t"] - evs[0]["t"]) / 3600
         head = f"My storyteller brain is busy, so here's the raw version from the last {span_h:.0f} hours: " \
@@ -1962,10 +2057,7 @@ class RobotHub:
             self._scan_stop.wait(self.SCAN_DWELL_S)
 
     def _start_scan_thread(self):
-        if self._scan_thread is None or not self._scan_thread.is_alive():
-            self._scan_stop.clear()
-            self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
-            self._scan_thread.start()
+        self._ensure_thread("_scan_thread", self._scan_stop, self._scan_loop)
 
     def set_watch(self, mode):
         """off | window (hold the aim David set + caption it) | scan (slow body
@@ -2163,10 +2255,18 @@ class RobotHub:
     def sleep(self):
         if self._asleep:
             return {"asleep": True}
+        # If a watch mode parked the gaze behaviors, fold their REAL pre-watch
+        # values back in before snapshotting — otherwise sleep captures the
+        # all-False parked state and wake() leaves him gaze-dead. Also clears
+        # the dangling _watch_saved so it can't leak into the next watch.
+        behaviors_snapshot = dict(self.behaviors)
+        if self._watch_saved:
+            behaviors_snapshot.update(self._watch_saved)
+            self._watch_saved = None
         # Remember how he was set up so wake() can put it all back.
         self._sleep_state = {
-            "behaviors": dict(self.behaviors),
-            "listening": self._listening,
+            "behaviors": behaviors_snapshot,
+            "listening": self._desired_listening,
             "brain": self.active,
             "pose": dict(self._pose),
         }
@@ -2230,10 +2330,14 @@ class RobotHub:
             self._apply_pose()
         if st.get("brain") in self.brains:
             self.active = st["brain"]
+        # persist=False: wake restores the SNAPSHOT, which must not clobber the
+        # durable on-disk preference — David may have toggled an opt-in (or
+        # listening) from the app while asleep, and that explicit choice already
+        # persisted; replaying the snapshot to disk would silently revert it.
         for k, v in st.get("behaviors", {}).items():
-            self.set_behavior(k, v)
+            self.set_behavior(k, v, persist=False)
         if st.get("listening"):
-            self.set_listening(True)
+            self.set_listening(True, persist=False)
         self._sleep_state = None
         self._mark_manual()                      # grace period before behaviors re-engage
         self._log("system", "☀️ awake")
