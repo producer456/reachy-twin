@@ -6,8 +6,8 @@ import re
 
 import numpy as np
 
-from twin.config import CLAUDE_VOICE, MARCUS_VOICE
-from twin.brains import make_claude, MarcusBrain
+from twin.config import CLAUDE_VOICE, MARCUS_VOICE, LOCAL_VOICE, LOCAL_URL
+from twin.brains import make_claude, MarcusBrain, LocalBrain
 
 SR = 16000
 SILENCE_HANG = 80         # ~0.8 s trailing silence ends an utterance
@@ -63,4 +63,10 @@ def build_brains():
         voices["marcus"] = MARCUS_VOICE
     except Exception as e:
         print(f"[warn] Marcus unavailable ({e}) -- Claude only")
+    if LOCAL_URL:
+        try:
+            brains["local"] = LocalBrain()
+            voices["local"] = LOCAL_VOICE
+        except Exception as e:
+            print(f"[warn] Local brain unavailable ({e})")
     return brains, voices

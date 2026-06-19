@@ -71,12 +71,15 @@ class RobotHub:
         self.stt = STT()
         self.tts = KokoroTTS()
         self.brains, self.voices = build_brains()
-        # Marcus is Reachy's RESTING brain (David's call 2026-06-12): it has all
-        # his tools (email/calendar/canvas/reminders) and lives on his own GPU.
-        # "Hey Claude" / the client picker still switches for a session, but
-        # every restart settles back on Marcus. Claude only by fallback when
-        # the Marcus link is down at boot.
-        self.active = "marcus" if "marcus" in self.brains else "claude"
+        # Reachy's RESTING brain. Preference: the on-device LOCAL brain (MLX on the
+        # Mac host -- no vr-2 GPU) > Marcus (vr-2 GPU, owns the tools) > Claude.
+        # Data questions (email/calendar/...) still detour to Marcus one turn in
+        # chat(), so the local brain handles conversation while Marcus's tools stay
+        # available. "Hey Claude"/the picker still switches for a session; every
+        # restart settles back on this default.
+        self.active = ("local" if "local" in self.brains
+                       else "marcus" if "marcus" in self.brains
+                       else "claude")
         self.reachy_voice = REACHY_VOICE    # his one voice, independent of the engine
         self.mini = None
         self.last_error = None     # last robot-connect failure (shown in /api/state)
@@ -148,6 +151,8 @@ class RobotHub:
                              "antenna_left": None, "antenna_right": None}
         self._cascade = None       # opencv face detector (lazy)
         self._pose = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "body": 0.0, "ant": 0.0}  # degrees
+        self._ant_l = 0.0          # independent antenna targets (streaming manual control)
+        self._ant_r = 0.0
         # iPad-relayed camera frame (used when robot camera is unavailable, e.g. Windows host)
         self._ipad_jpeg = None
         self._ipad_jpeg_ts = 0.0
@@ -583,6 +588,7 @@ class RobotHub:
                     finally:
                         self._lock.release()
                 time.sleep(0.18)
+            base = self._ant_motor_safe(base)            # settle OUT of the backlash buzz band (was the "always vibrating" cause)
             for _ in range(10):                          # settle back -- retry through lock contention
                 if self._lock.acquire(timeout=1.0):
                     try:
@@ -794,6 +800,35 @@ class RobotHub:
         "you", "bye", "okay", "so", "yeah", "um", "uh", "the", "oh",
         "you're welcome", "please subscribe", "like and subscribe",
     }
+
+    def voice_chat(self, wav_bytes, brain=None):
+        """Decode a WAV clip (any rate/width/channels), transcribe it, then run it
+        through chat() so Reachy speaks the reply. Backs the watch push-to-talk
+        relay (POST /api/voice_chat). Returns {text, reply, brain, ...}."""
+        import audioop
+        import io
+        import wave
+        try:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+                rate, width, chans = w.getframerate(), w.getsampwidth(), w.getnchannels()
+                raw = w.readframes(w.getnframes())
+        except Exception as e:
+            return {"brain": self.active, "reply": "", "text": "", "error": f"bad audio: {e}"}
+        if not raw:
+            return {"brain": self.active, "reply": "", "text": ""}
+        if width != 2:
+            raw = audioop.lin2lin(raw, width, 2)
+        if chans == 2:
+            raw = audioop.tomono(raw, 2, 0.5, 0.5)
+        if rate != 16000:
+            raw, _ = audioop.ratecv(raw, 2, 1, rate, 16000, None)
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        text = (self.stt.transcribe(audio) or "").strip()
+        if not text or text.strip(" .!?,").lower() in self.STT_HALLUCINATIONS:
+            return {"brain": self.active, "reply": "", "text": text}
+        result = self.chat(text, brain=brain, spoken=True)
+        result["text"] = text
+        return result
 
     def _mic_loop(self, gen):
         while self._mic_gen == gen and self._mic_active():
@@ -2206,6 +2241,9 @@ class RobotHub:
 
     _JOG_LIMITS = {"yaw": HEAD_YAW_SAFE, "body": 90, "ant": 90}  # degrees; pitch/roll clamped asymmetrically
     ANT_REST_DEG = 8   # antennas held at exactly 0 deg hunt (backlash); a small offset stops it
+    HEAD_TRANS_SAFE = 12.0   # mm, +- on head x/y/z translation. CONSERVATIVE: the Stewart
+                             # platform can bump the shell when translation stacks with deep
+                             # roll/pitch -- widen only after live-verifying clearance.
 
     def _clamp_head(self, part, v):
         """Clamp a head/body/antenna target to the shell-safe envelope.
@@ -2224,7 +2262,8 @@ class RobotHub:
         from reachy_mini.utils import create_head_pose
         p = self._pose
         head = create_head_pose(roll=p["roll"], pitch=p["pitch"], yaw=p["yaw"], degrees=True)
-        ant = np.deg2rad([p["ant"] + self.ANT_REST_DEG, p["ant"] + self.ANT_REST_DEG])
+        a_motor = self._ant_motor_safe(p["ant"] + self.ANT_REST_DEG)   # keep out of the backlash buzz band
+        ant = np.deg2rad([a_motor, a_motor])
         # Travel time scales with distance: a 30-deg [look:left] glance should
         # glide (~0.9s), not snap in 0.35s like a tiny nudge. Streamed iPad
         # tracking sends small deltas, so those stay at the fast base time.
@@ -2325,10 +2364,104 @@ class RobotHub:
     def center(self):
         for k in self._pose:
             self._pose[k] = 0.0
+        self._ant_l = self._ant_r = 0.0
         self._doa_hist.clear()
         self._follow_since = None
         self._mark_manual()
         return self._apply_pose()
+
+    # The antenna motors hunt (backlash limit-cycle) when their MOTOR angle lands in a
+    # band around mechanical zero. Live sweep 2026-06-16 (motor frame = command +
+    # ANT_REST_DEG): buzzes ~1deg p-p for motor angle in ~[-4,+11]; rock-steady (<0.1deg)
+    # at <=-7 and >=+12. This bit "always vibrating" because the 8deg rest offset AND the
+    # thinking-flutter's settle both park the motor at +8 -- inside the band. Snap any
+    # motor-frame antenna target out of (-7,+12) to the nearer steady edge (both tested
+    # dead-still). Applied at every send site: rest/_apply_pose, stream, flutter settle.
+    # Avoid band the (worse) LEFT motor can't hold, WITH margin: the band edges -7/+12
+    # were metastable (still ~0.6deg buzz when parked there); only motor <=-8 and >=+13
+    # held rock-still (<0.1deg). So snap into the steady zone with margin, not to the edge.
+    ANT_HUNT_MOTOR_LO = -8.0
+    ANT_HUNT_MOTOR_HI = 13.0
+    ANT_STABLE_LO = -10.0   # steady anchor below the band
+    ANT_STABLE_HI = 14.0    # steady anchor above the band
+
+    def _ant_motor_safe(self, motor_deg):
+        """Keep a MOTOR-frame antenna angle out of the backlash hunting band."""
+        if self.ANT_HUNT_MOTOR_LO < motor_deg < self.ANT_HUNT_MOTOR_HI:
+            mid = (self.ANT_HUNT_MOTOR_LO + self.ANT_HUNT_MOTOR_HI) / 2.0
+            return self.ANT_STABLE_LO if motor_deg < mid else self.ANT_STABLE_HI
+        return motor_deg
+
+    def _clamp_trans(self, v):
+        """Clamp a head translation (mm) to the conservative shell-safe envelope."""
+        if v is None:
+            return 0.0
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(v):
+            return 0.0
+        return max(-self.HEAD_TRANS_SAFE, min(self.HEAD_TRANS_SAFE, v))
+
+    def stream_target(self, **kw):
+        """Low-latency continuous manual posing for a streaming control surface.
+
+        Unlike jog()/look()/center() -- which route through _apply_pose's
+        interpolated goto_target -- this uses the SDK's NON-BLOCKING set_target so
+        a client can push ~20Hz and get a fluid analog feel (mirrors Pollen's
+        desktop-app controller). Partial updates: omit any field to hold it.
+        Exposes the full surface the d-pad never did: roll, 360 body yaw,
+        INDEPENDENT antennas, and (conservatively) head x/y/z translation.
+        Degrees for angles, mm for translation."""
+        mini = self.mini                       # snapshot: supervisor may null it mid-call
+        if mini is None:
+            return dict(self._pose)
+        p = self._pose
+        if kw.get("yaw") is not None:
+            p["yaw"] = self._clamp_head("yaw", float(kw["yaw"]))
+        if kw.get("pitch") is not None:
+            p["pitch"] = self._clamp_head("pitch", float(kw["pitch"]))
+        if kw.get("roll") is not None:
+            p["roll"] = self._clamp_head("roll", float(kw["roll"]))
+        if kw.get("body") is not None:
+            p["body"] = self._clamp_head("body", float(kw["body"]))
+        # Antennas: independent L/R; a single 'ant' drives both (back-compat).
+        al, ar = kw.get("ant_l"), kw.get("ant_r")
+        if kw.get("ant") is not None and al is None and ar is None:
+            al = ar = float(kw["ant"])
+        if al is not None:
+            self._ant_l = max(-90.0, min(90.0, float(al)))
+        if ar is not None:
+            self._ant_r = max(-90.0, min(90.0, float(ar)))
+        p["ant"] = (self._ant_l + self._ant_r) / 2.0   # keep the single-field model coherent
+        tx, ty, tz = self._clamp_trans(kw.get("x")), self._clamp_trans(kw.get("y")), self._clamp_trans(kw.get("z"))
+        vals = [p["yaw"], p["pitch"], p["roll"], p["body"], self._ant_l, self._ant_r, tx, ty, tz]
+        if not all(np.isfinite(v) for v in vals):    # reject a glitched stream frame
+            return self._target_state()
+        from reachy_mini.utils import create_head_pose
+        # mm=True: x/y/z are millimetres (default mm=False would read them as METRES).
+        head = create_head_pose(x=tx, y=ty, z=tz, roll=p["roll"], pitch=p["pitch"],
+                                yaw=p["yaw"], mm=True, degrees=True)
+        ant = np.deg2rad([self._ant_motor_safe(self._ant_l + self.ANT_REST_DEG),
+                          self._ant_motor_safe(self._ant_r + self.ANT_REST_DEG)])
+        body_yaw = np.deg2rad(p["body"])
+        try:
+            with self._lock:
+                if hasattr(mini, "set_target"):    # preferred: immediate, no interpolation
+                    mini.set_target(head=head, body_yaw=body_yaw, antennas=ant)
+                else:                              # older SDK: short goto approximates streaming
+                    mini.goto_target(head=head, body_yaw=body_yaw, antennas=ant, duration=0.08)
+        except Exception as e:                     # link dropped mid-stream -> don't 500 the endpoint
+            self._log("system", f"stream_target failed (link?): {e}")
+        self._mark_manual()
+        return self._target_state(tx, ty, tz)
+
+    def _target_state(self, x=0.0, y=0.0, z=0.0):
+        out = dict(self._pose)
+        out["ant_l"], out["ant_r"] = self._ant_l, self._ant_r
+        out["x"], out["y"], out["z"] = x, y, z
+        return out
 
     # ---------- sleep / wake ----------
     # Sleep snapshots how he's set up + where he's posed, parks the behaviors,

@@ -9,6 +9,9 @@ is developed in the **iOS Simulator** (talks to the hub at `http://localhost:850
 1. `cd reachy-twin && bash setup_host.sh`  — installs the stack + Kokoro/Piper models, makes `.env`.
 2. Edit `.env`: `MARCUS_URL=http://100.67.2.40:7860` (vr-2 over Tailscale); leave `ANTHROPIC_API_KEY`
    blank (Claude runs FREE via the Mac's Claude-CLI subscription).
+   **As of 2026-06-19 the DEFAULT brain is `Local` — an on-device Qwen via `mlx_lm.server` on the Mac
+   (`LOCAL_URL=http://127.0.0.1:8081`, launchd `com.legionstage.reachy-mlx`), so general chat no longer
+   touches the vr-2 GPU; Marcus stays wired only for the email/calendar/tool detour.**
 3. Plug Reachy in (USB-C + the **7V-5A** motor supply). `./.venv/bin/reachy-mini-daemon` →
    confirm all 9 motors, then `./.venv/bin/python step0_alive.py` to see him move.
 4. `./.venv/bin/python -m twin.panel` → verify `http://localhost:8500/api/state`.

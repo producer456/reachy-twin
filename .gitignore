@@ -4,3 +4,11 @@ models/
 _ref_conversation_app/
 __pycache__/
 *.pyc
+
+# runtime logs (were bloating to 100s of MB of audio-spam)
+*.log
+*.err
+# runtime state + privacy data (faceprints, room-memory log)
+faces/
+behavior_state.json
+room_events.json

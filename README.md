@@ -1,13 +1,14 @@
 # reachy-twin
 
-A **dual-brain voice companion** for the [Reachy Mini](https://reachymini.net/) (Lite) desktop robot.
-Two AI personalities share one robot body — switch between them by name — with local
+A **multi-brain voice companion** for the [Reachy Mini](https://reachymini.net/) (Lite) desktop robot.
+Switchable AI brains share one robot body — including a fully **on-device local LLM** — with local
 speech-to-text, local text-to-speech, expressive emotion/dance moves, autonomous
 behaviors, and a web control panel.
 
-- 🧠 **Two brains, switchable by voice** — say *"Hey Claude"* or *"Hey Marcus"* to swap who's talking
+- 🧠 **Three brains, switchable** — the on-device **Local** brain (default), or *"Hey Claude"* / *"Hey Marcus"*
+  - **Local** — an on-device LLM (Qwen via [MLX](https://github.com/ml-explore/mlx)) behind an OpenAI-compatible endpoint; runs entirely on the host, no GPU server required. **Reachy's default engine.**
   - **Claude** via the Claude Code CLI (runs on your subscription, no API key) or the Anthropic API
-  - **Marcus** via any self-hosted LLM endpoint (`/api/chat` SSE)
+  - **Marcus** via any self-hosted LLM endpoint (`/api/chat` SSE) — also the tool/data tier (email, calendar, …) that the Local brain detours to for questions it has no tools for
 - 🎙️ **Local & private** — [faster-whisper](https://github.com/SYSTRAN/faster-whisper) ears,
   [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) voice (each brain its own voice)
 - 💃 **Expressive** — 81 emotions + 20 dances from Pollen's HF libraries, triggerable from the panel
@@ -19,16 +20,17 @@ behaviors, and a web control panel.
 ## Architecture
 
 ```
-mic -> faster-whisper -> ROUTER (Hey Claude / Hey Marcus) -> brain -> [mood] -> emotion move
-                                          |                              |
-                                    Claude CLI / API              Kokoro TTS -> speaker
-                                    Marcus endpoint
+mic -> faster-whisper -> ROUTER (Local default / Hey Claude / Hey Marcus) -> brain -> [mood] -> emotion move
+                                          |                                          |
+                                    Local MLX (on-device, default)          Kokoro TTS -> speaker
+                                    Claude CLI / API
+                                    Marcus endpoint (+ data/tool detour)
 ```
 
 - `twin/hub.py` — `RobotHub`: one shared `ReachyMini` connection, brains, mic loop, behaviors (thread-safe)
 - `twin/panel.py` — FastAPI control panel (serves `twin/static/index.html`)
 - `twin/app.py` — standalone voice loop + the wake-word router helpers
-- `twin/brains.py` — Claude (CLI/API) + Marcus brains, mood tagging
+- `twin/brains.py` — Local (MLX/on-device, default) + Claude (CLI/API) + Marcus brains, mood tagging
 - `twin/stt.py` / `twin/tts.py` — Whisper STT / Kokoro + Piper TTS
 - `vol.py` — quick speaker-volume helper
 
@@ -72,6 +74,23 @@ powershell -ExecutionPolicy Bypass -File .\setup_host.ps1
 
 Only `MARCUS_URL` differs per host: point it at Marcus over the network from a laptop,
 or at `localhost` on the machine that actually runs Marcus.
+
+## Local on-device brain (default)
+
+Reachy's default engine is a local LLM running on the host — no GPU server needed.
+On Apple Silicon, serve it with [MLX](https://github.com/ml-explore/mlx):
+
+```bash
+pip install mlx-lm
+mlx_lm.server --model mlx-community/Qwen3-4B-4bit --host 127.0.0.1 --port 8081
+# then in .env:  LOCAL_URL=http://127.0.0.1:8081
+```
+
+The default `self.active` priority is **Local → Marcus → Claude**. Data/tool questions
+(email, calendar, …) auto-detour to the Marcus brain for one turn, so the small local
+model handles conversation while Marcus's tools stay available. Pick the model to fit the
+host's RAM — `Qwen3-4B-4bit` (~2.3 GB) suits a shared 16 GB machine; bump to `Qwen3-8B-4bit`
+if it's dedicated.
 
 ## Notes
 

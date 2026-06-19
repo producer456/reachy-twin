@@ -15,7 +15,7 @@ import subprocess
 import urllib.request
 import uuid
 
-from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MARCUS_URL
+from .config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MARCUS_URL, LOCAL_URL, LOCAL_MODEL
 
 
 def looks_like_tool_call(t: str) -> bool:
@@ -268,6 +268,75 @@ class ClaudeCLIBrain(_ChatBrain):
 def make_claude():
     """API brain if a key is set, otherwise the CLI/subscription brain."""
     return ClaudeBrain() if ANTHROPIC_API_KEY else ClaudeCLIBrain()
+
+
+# Qwen3 emits an internal <think>...</think> trace before its answer. We run it
+# with thinking OFF (the "/no_think" hint), but strip any leak defensively so a
+# reasoning trace is never spoken aloud. Also strip ChatML special tokens
+# (<|im_end|>, <|endoftext|>, ...) that occasionally leak into the content.
+_THINK_RX = re.compile(r"<think>.*?</think>", re.S | re.I)
+_SPECIAL_RX = re.compile(r"<\|[^|>]*\|>")
+
+
+def _clean_local(text: str) -> str:
+    text = _THINK_RX.sub("", text or "")
+    text = _SPECIAL_RX.sub("", text)
+    return text.strip()
+
+
+class LocalBrain(_ChatBrain):
+    """On-device LLM via a local MLX server (OpenAI-compatible /v1/chat/completions).
+
+    This is Reachy's brain WITHOUT the vr-2 GPU: inference runs on the Mac host
+    itself. Same identity path as the others (reachy_system() as the system
+    message); history rides along so follow-ups keep their referent. Data
+    questions (email/calendar/...) still detour to the Marcus brain one turn in
+    hub.py -- this brain has no tools, it just talks.
+    """
+    name = "Local"
+    other = "Marcus"
+
+    def __init__(self, url: str = LOCAL_URL, model: str = LOCAL_MODEL):
+        super().__init__()
+        self.url = (url or "").rstrip("/")
+        if not self.url:
+            raise RuntimeError("LOCAL_URL not set -- add it to .env")
+        self.model = model
+        self.endpoint = self.url + "/v1/chat/completions"
+
+    def _ask_local(self, user_text: str) -> str:
+        # "/no_think" keeps Qwen3 out of its slow reasoning mode for snappy,
+        # speakable replies; harmless on models that don't recognize it.
+        system = reachy_system() + "\n\n/no_think"
+        messages = ([{"role": "system", "content": system}]
+                    + self.history[:-1]
+                    + [{"role": "user", "content": user_text}])
+        body = json.dumps({
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": 220,
+            "temperature": 0.7,
+            "top_p": 0.95,
+        }).encode()
+        req = urllib.request.Request(
+            self.endpoint, data=body,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                obj = json.loads(resp.read().decode("utf-8", "replace"))
+            text = obj["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"I can't reach my local brain right now: {e}"
+        return _clean_local(text)
+
+    def reply(self, user_text: str) -> str:
+        self._remember("user", user_text)
+        text = (self._ask_local(user_text) or "").strip() or "Hm, I got nothing back."
+        # Keep [mood]/[dance]/[look] tags intact: hub.chat runs strip_mood ->
+        # _extract_actions -> clean_for_speech in order (same as MarcusBrain).
+        self._remember("assistant", text)
+        return text
 
 
 class MarcusBrain(_ChatBrain):

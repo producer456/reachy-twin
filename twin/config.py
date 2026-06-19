@@ -30,3 +30,9 @@ WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "int8")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-8")
 MARCUS_URL = os.getenv("MARCUS_URL", "")  # e.g. http://vr-2:PORT  (set per host)
+
+# Local on-device LLM (MLX server on the Mac host) -- Reachy's brain without the
+# vr-2 GPU. Empty LOCAL_URL disables it (build_brains skips it gracefully).
+LOCAL_URL = os.getenv("LOCAL_URL", "")           # e.g. http://127.0.0.1:8081
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "mlx-community/Qwen3-8B-4bit")
+LOCAL_VOICE = os.getenv("LOCAL_VOICE", os.getenv("REACHY_VOICE", "bf_lily"))
