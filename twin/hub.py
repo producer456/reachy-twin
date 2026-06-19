@@ -96,6 +96,8 @@ class RobotHub:
         self._listen_lock = threading.Lock()   # serialize set_listening (off->on race)
         self._mic_gen = 0                      # generation token: a loop dies when this moves
         self._thread = None
+        self._thread_gen = -1                  # gen the live mic loop was started with (deafness-race guard)
+        self._voiceid_down_until = 0.0         # fail-open window after a Marcus voice-id failure
         self._desired_listening = True         # session intent (exit-words flip this only)
         self._persist_listening = True         # durable preference written to disk
         self._thresh = 0.02
@@ -751,6 +753,12 @@ class RobotHub:
         hiccup can never lock David out of his own robot."""
         if not MARCUS_URL:
             return True, None
+        # This runs INSIDE the mic loop, so a slow/rebooting Marcus would stall EVERY
+        # gated utterance (up to the timeout) before failing open. After one failure,
+        # fail open instantly for 30s instead of hammering a down server and freezing
+        # his hearing -- he keeps listening, just without the only-David gate.
+        if time.time() < self._voiceid_down_until:
+            return True, None
         try:
             import io
             import wave
@@ -764,7 +772,7 @@ class RobotHub:
             req = urllib.request.Request(
                 MARCUS_URL.rstrip("/") + "/voice/identify", data=bio.getvalue(),
                 headers={"Content-Type": "audio/wav"}, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=3) as r:
                 out = json.loads(r.read().decode())
             verdict = out.get("is_david")
             match = out.get("match")
@@ -788,6 +796,7 @@ class RobotHub:
             self._log("system", f"voice-id match={match} david={verdict}")
             return bool(verdict), match
         except Exception:
+            self._voiceid_down_until = time.time() + 30   # back off; don't re-stall the mic loop
             return True, None
 
     VOICE_GATE_ON_RX = re.compile(r"\bonly (listen|respond|reply) to me\b", re.I)
@@ -847,7 +856,9 @@ class RobotHub:
                 # Passive room-listening: log overheard speech for "what did I
                 # miss", and (when that's the only mode) never respond.
                 acting = self._listening
-                if self.behaviors.get("wake_word"):
+                # Wake-word gating only applies when active listening is OFF -- otherwise
+                # turning wake_word on would silently SUPPRESS the listening he already had.
+                if self.behaviors.get("wake_word") and not self._listening:
                     if now < self._wakeUntil:
                         self._wakeUntil = now + self.WAKE_WINDOW   # refresh the window
                         acting = True
@@ -855,8 +866,8 @@ class RobotHub:
                         self._wakeUntil = now + self.WAKE_WINDOW
                         self._think_cue(True)                      # beep + perk: "I'm listening"
                         rest = self.REACHY_WAKE.sub("", text, count=1).strip(" ,.!?-")
-                        if len(rest) < 2:
-                            continue                               # just woke; await the command
+                        if len(rest) < 2 or rest.strip(" .!?,").lower() in self.STT_HALLUCINATIONS:
+                            continue                               # just woke (or STT noise); await the command
                         text = rest                                # the command after "hey Reachy"
                         acting = True
                     else:
@@ -907,6 +918,12 @@ class RobotHub:
                     self._desired_listening = False   # session-only (not persisted)
                     self._wakeUntil = 0               # also close any wake window
                     continue   # loop continues only if wake_word/room_listen keep the mic active
+                # Drop a leading misheard self-address ("Ricky, ...") so the brain
+                # never sees -- and parrots back -- a wrong name (keep the bare name
+                # if that's literally all he said, so being called still gets a reply).
+                spoken_cmd = self._SELF_ADDRESS_RX.sub("", text, count=1).strip()
+                if spoken_cmd:
+                    text = spoken_cmd
                 self.chat(text, spoken=True)
             except Exception as e:
                 # one STT/capture hiccup must not silently end listening
@@ -1028,7 +1045,12 @@ class RobotHub:
     WAKE_WINDOW = 25.0      # seconds of active command-listening after "hey Reachy"
     # Lenient wake phrase: Whisper mangles "Reachy" (reach/reachy/richie/ritchie/
     # "reach he"), so match the family. Bias to catch it — a miss = he ignores you.
-    REACHY_WAKE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?(reach\w*|rich\w*|ritchie|reachie)\b", re.I)
+    REACHY_WAKE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?(reach\w*|rich\w*|rick\w*|ritchie|reachie)\b", re.I)
+    # Strip a LEADING self-address ("Reachy,", "Hey Ricky," -- STT mishears the name) before
+    # handing the command to the brain, so a small model never parrots the misheard name back.
+    # Leading-anchored, so mid-sentence words ("I feel rich") are untouched.
+    _SELF_ADDRESS_RX = re.compile(
+        r"^\s*(?:hey|hi|ok|okay)?[\s,]*(?:reach\w*|rich\w*|rick\w*|ritchie|reachie)\b[\s,.:!?-]*", re.I)
 
     def _mic_active(self):
         """The mic loop runs in ANY capture mode: active listening, wake-word
@@ -1040,12 +1062,20 @@ class RobotHub:
         """Start or stop the single mic loop to match _mic_active(). Serialized;
         a stale loop self-retires when _mic_gen moves (see set_listening note)."""
         with self._listen_lock:
-            running = self._thread is not None and self._thread.is_alive()
+            # "running" must mean a loop whose generation is STILL CURRENT. A loop
+            # that's alive but STALE (its gen was invalidated by an earlier off-toggle
+            # while it was blocked in chat()/capture/voice-id) is about to exit -- if we
+            # counted it as running we'd skip starting a fresh loop and leave him deaf
+            # with _listening still True, which the supervisor won't fix (it only
+            # re-enforces when _listening is False). So key on gen, not just is_alive().
+            running = (self._thread is not None and self._thread.is_alive()
+                       and self._thread_gen == self._mic_gen)
             if self._mic_active() and not running:
                 if self.mini is None:
                     return
                 self._mic_gen += 1
                 gen = self._mic_gen
+                self._thread_gen = gen
                 self._thread = threading.Thread(target=self._mic_loop, args=(gen,), daemon=True)
                 self._thread.start()
             elif not self._mic_active() and running:
