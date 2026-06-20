@@ -128,10 +128,32 @@ def get_actions_hint():
     return _ACTIONS_HINT
 
 
+# Live physical self-awareness, refreshed by the hub right before each reply (his
+# heading, whether someone's in front of him, etc.) so he can converse with body
+# awareness ("I'm looking right at you"). Empty = nothing to add.
+_SELF_STATE = ""
+
+
+def set_self_state(note: str):
+    global _SELF_STATE
+    _SELF_STATE = note or ""
+
+
+def get_self_state() -> str:
+    return _SELF_STATE
+
+
 def reachy_system() -> str:
-    """The one Reachy identity, current actions baked in. Every brain feeds this to
-    its engine, so Reachy is the same character whether Claude or Marcus is running."""
-    return SYSTEM_TMPL.format(actions=get_actions_hint())
+    """The one Reachy identity, current actions + live self-state baked in. Every
+    brain feeds this to its engine, so Reachy is the same character (and equally
+    self-aware) whether Local, Claude, or Marcus is running."""
+    s = SYSTEM_TMPL.format(actions=get_actions_hint())
+    if _SELF_STATE:
+        s += (" YOUR BODY RIGHT NOW -- this is a LIVE reading of your own position at "
+              "THIS instant; it is the truth and OVERRIDES anything you said earlier in "
+              "the conversation about where you are. Weave it in only when it's relevant "
+              "(don't just recite it): " + _SELF_STATE)
+    return s
 
 # Mood tag -> emotion move name (from pollen-robotics/reachy-mini-emotions-library)
 MOOD_TO_EMOTION = {
@@ -311,9 +333,16 @@ class LocalBrain(_ChatBrain):
         # "/no_think" keeps Qwen3 out of its slow reasoning mode for snappy,
         # speakable replies; harmless on models that don't recognize it.
         system = reachy_system() + "\n\n/no_think"
-        messages = ([{"role": "system", "content": system}]
-                    + self.history[:-1]
-                    + [{"role": "user", "content": user_text}])
+        messages = [{"role": "system", "content": system}] + self.history[:-1]
+        # Re-state his live body sensors as the MOST RECENT context, right before the
+        # question -- a small model otherwise parrots its own earlier answer about its
+        # pose from history instead of reading the (stale-by-comparison) system prompt.
+        st = get_self_state()
+        if st:
+            messages.append({"role": "system",
+                             "content": "[Your live body sensors, THIS moment -- this is the "
+                                        "current truth, ignore what you said before]: " + st})
+        messages.append({"role": "user", "content": user_text})
         body = json.dumps({
             "model": self.model,
             "messages": messages,

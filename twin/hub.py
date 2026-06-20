@@ -38,7 +38,7 @@ from twin.voice import (
     build_brains, detect_switch, strip_wake, calibrate_floor,
     _rms, _mono, SR, EXIT_WORDS, SPEECH_START, SILENCE_HANG, MIN_CHUNKS,
 )
-from twin.brains import strip_mood, MOOD_TO_EMOTION, clean_for_speech
+from twin.brains import strip_mood, MOOD_TO_EMOTION, clean_for_speech, set_self_state
 from twin.config import MARCUS_URL, REACHY_VOICE
 from twin.room_memory import RoomMemory
 
@@ -715,6 +715,7 @@ class RobotHub:
                     kw = dm.group(1).lower()
                     self._last_topic = ("email" if re.match(r"e-?mail|g-?mail|inbox|unread", kw)
                                         else kw)
+                set_self_state(self._self_state_note())   # live body awareness for this turn
                 reply = self.brains[use].reply(msg)
                 self._last_data_brain = use
         except Exception as e:                   # an API/network error must not 500 the route
@@ -1257,6 +1258,38 @@ class RobotHub:
             return float(head[0]), yaw, pitch
         except Exception:
             return None, None, None
+
+    def _self_state_note(self):
+        """One short, plain-language line on his CURRENT physical state, injected into
+        the brain prompt each turn so he converses with body awareness ("I'm looking
+        right at you"). Cheap + LOCAL only (no vision-sidecar call) so it adds no
+        reply latency. Asserts only what it actually knows -- head tilt (the pitch
+        sign is reliable) and POSITIVE presence -- and stays silent on anything
+        uncertain (yaw left/right is frame-ambiguous; a stale camera must never let
+        him claim he's alone)."""
+        if self.mini is None or self._asleep:
+            return ""
+        bits = []
+        try:
+            b, y, p = self._read_pose()
+            pitch = float(np.rad2deg(p)) if p is not None else 0.0
+            world = ((float(np.rad2deg(y)) if y is not None else 0.0)
+                     + (float(np.rad2deg(b)) if b is not None else 0.0))
+            turned = abs(world) >= 25
+            side = " and turned to one side" if turned else ""
+            if pitch <= -12:
+                bits.append("your head is tilted up" + side)
+            elif pitch >= 14:
+                bits.append("your head is tilted down toward the desk" + side)
+            elif turned:
+                bits.append("your head is turned off to one side")
+            else:
+                bits.append("you're facing forward with your head level")
+        except Exception:
+            pass
+        if self.behaviors.get("face_track") and time.time() - self._face_seen_ts < 4.0:
+            bits.append("someone is right in front of you and you are looking at them")
+        return ("Right now " + "; ".join(bits) + ".") if bits else ""
 
     def _gaze_tick(self):
         now = time.time()
