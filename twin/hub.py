@@ -1360,11 +1360,16 @@ class RobotHub:
         # / follow drive goto_target without writing _pose, so without this the
         # idle tick would command a stale _pose and snap the head off the last
         # tracked position. Easing then starts from his real pose.
-        b, y, p = self._read_pose()
+        # Re-sync ONLY yaw + body from the measured pose: face-track/sound/follow
+        # drive those via goto_target without writing _pose, so idle must read them
+        # back or it'd snap the head off the last tracked position. PITCH is NOT
+        # re-read: the measured pitch (from m[2,0]) picks up yaw/body coupling, and
+        # feeding it back made idle CONVERGE the head UP to ~-28deg -- he stared at
+        # the ceiling when left alone. Easing the last COMMANDED pitch toward
+        # neutral (below) is stable; create_head_pose(pitch=0) reads back as level.
+        b, y, _p = self._read_pose()
         if y is not None:
             self._pose["yaw"] = float(np.rad2deg(y))
-        if p is not None:
-            self._pose["pitch"] = float(np.rad2deg(p))
         if b is not None:
             self._pose["body"] = float(np.rad2deg(b))
         # ease the resting baseline back toward neutral (return-to-center when left alone)
