@@ -43,7 +43,11 @@ from twin.config import MARCUS_URL, REACHY_VOICE
 from twin.room_memory import RoomMemory
 
 DAEMON = "http://localhost:8000"
-BODY_YAW_MAX = 2.7   # rad, mechanical-ish limit used everywhere we command the body
+# Autonomous body-yaw cap. Was 2.7 rad (~155deg) -- the follow layer happily drove
+# his body to -131deg chasing sound/faces and he TIPPED OVER. ~70deg is well short of
+# the tip point while still letting him follow someone around the desk (head adds
+# another +-38deg of reach). Tune DOWN if it strains the cable or feels unstable.
+BODY_YAW_MAX = float(np.deg2rad(70))   # rad; autonomous body-rotation safety cap
 GESTURE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gestures")
 FACES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "faces")
 FACE_PROFILE_FILE = os.path.join(FACES_DIR, "profiles.json")
@@ -1389,7 +1393,11 @@ class RobotHub:
             self._cascade = cv2.CascadeClassifier(
                 os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return self._cascade.detectMultiScale(gray, 1.2, 5, minSize=(60, 60))
+        # minNeighbors 5->8 and minSize 60->96: the loose settings false-positived on
+        # ceiling lights / wall corners, so he'd stare at the ceiling when left alone.
+        # A real face on a DESK robot is large in frame, so a bigger minSize + stricter
+        # neighbor vote rejects the small spurious "faces" without losing David up close.
+        return self._cascade.detectMultiScale(gray, 1.2, 8, minSize=(96, 96))
 
     # Shell-clearance envelope for the HEAD axes — the rim contacts the shell at
     # deep pitch combined with yaw. SINGLE SOURCE OF TRUTH: face tracking AND
