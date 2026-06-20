@@ -8,7 +8,8 @@ __pycache__/
 # runtime logs (were bloating to 100s of MB of audio-spam)
 *.log
 *.err
-# runtime state + privacy data (faceprints, room-memory log)
+# runtime state + privacy data (faceprints, room-memory log, durable memory)
 faces/
 behavior_state.json
 room_events.json
+reachy_memory.json

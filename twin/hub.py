@@ -38,7 +38,7 @@ from twin.voice import (
     build_brains, detect_switch, strip_wake, calibrate_floor,
     _rms, _mono, SR, EXIT_WORDS, SPEECH_START, SILENCE_HANG, MIN_CHUNKS,
 )
-from twin.brains import strip_mood, MOOD_TO_EMOTION, clean_for_speech, set_self_state
+from twin.brains import strip_mood, MOOD_TO_EMOTION, clean_for_speech, set_self_state, set_memory
 from twin.config import MARCUS_URL, REACHY_VOICE
 from twin.room_memory import RoomMemory
 
@@ -174,6 +174,8 @@ class RobotHub:
         self._last_write_ok = 0.0             # wall-clock of the last successful motor write
         self._thinking = threading.Event()   # set while a brain works; drives antenna flutter
         self._recording_gesture = False      # behaviors pause while limp for hand-guiding
+        self._memory = self._load_memory()   # durable cross-session facts (survives restarts)
+        self._push_memory()                  # make them available to the brain immediately
         os.makedirs(GESTURE_DIR, exist_ok=True)
 
     def push_ipad_frame(self, jpeg_bytes):
@@ -680,6 +682,33 @@ class RobotHub:
                 move = self._get_emotion_move("cheerful1") if self.behaviors.get("emotions_on_cue") else None
                 self._enqueue_say(made, move)
                 return {"brain": self.active, "reply": made, "reminder": True}
+        # "Remember that X" -> durable cross-session memory (deterministic, survives
+        # restarts). Skip questions ("do you remember …?").
+        if not re.match(r"\s*(?:do|does|did|can|could|will|would|have|are)\s+you\b", msg, re.I):
+            rb = self.REMEMBER_RX.search(msg)
+            if rb:
+                what = rb.group(1).strip(" .!?,;:'\"")
+                if len(what) >= 2 and self.remember(what):
+                    reply = "Got it -- I'll remember that."
+                    self._log(self.active, reply)
+                    move = self._get_emotion_move("cheerful1") if self.behaviors.get("emotions_on_cue") else None
+                    self._enqueue_say(reply, move)
+                    return {"brain": self.active, "reply": reply, "remember": True}
+        # "Forget about X" / "forget everything" -> drop memory. "forget it" (ambiguous)
+        # falls through to normal chat.
+        fg = self.FORGET_RX.search(msg)
+        if fg:
+            what = fg.group(1).strip(" .!?,;:'\"")
+            lw = what.lower()
+            reply = ""
+            if lw in ("everything", "all", "it all", "all of it", "all of them", "all that"):
+                self.forget(None); reply = "Okay, I've cleared what I was remembering."
+            elif len(what) >= 4 and lw not in ("that", "this", "it", "them", "about it"):
+                self.forget(what); reply = "Okay, I've let that go."
+            if reply:
+                self._log(self.active, reply)
+                self._enqueue_say(reply, None)
+                return {"brain": self.active, "reply": reply, "forget": True}
         # Fold ordinary conversation into the room timeline (part of "what happened").
         if self.behaviors.get("room_memory"):
             self.room.add("speech", f'heard: "{text[:120]}"')
@@ -1115,6 +1144,64 @@ class RobotHub:
             os.replace(tmp, self._BEHAVIOR_STATE_PATH)
         except Exception:
             pass
+
+    # ---------- durable cross-session memory ----------
+    # Short facts David told Reachy to remember; persisted to disk and recalled into
+    # every conversation (even after a restart). The WRITE path is deterministic
+    # (David saying "remember…"), not a 4B decision.
+    _MEMORY_PATH = Path(__file__).resolve().parent.parent / "reachy_memory.json"
+    MEMORY_MAX = 60
+    # "remember that/this/my/I/we X", "don't forget X", "keep in mind X" -> store.
+    # Won't match "remember TO …" (that's a reminder) or "remember when …".
+    REMEMBER_RX = re.compile(
+        r"\b(?:remember\s+(?:that|this|how|my|i\b|i'?m|i'?ve|we|the|our)|"
+        r"don'?t\s+forget(?:\s+(?:that|about))?|keep\s+in\s+mind(?:\s+that)?)\s*[:,]?\s*(.+)",
+        re.I)
+    FORGET_RX = re.compile(r"\bforget\s+(?:about\s+|that\s+)?(.+)", re.I)
+
+    def _load_memory(self):
+        try:
+            d = json.loads(self._MEMORY_PATH.read_text(encoding="utf-8"))
+            notes = d.get("notes", []) if isinstance(d, dict) else []
+            return [n for n in notes if isinstance(n, dict) and n.get("text")]
+        except Exception:
+            return []
+
+    def _save_memory(self):
+        try:
+            tmp = str(self._MEMORY_PATH) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"notes": self._memory}, f)
+            os.replace(tmp, self._MEMORY_PATH)
+        except Exception:
+            pass
+
+    def _push_memory(self):
+        """Publish current memory to the brain (system-prompt recall, all engines)."""
+        notes = getattr(self, "_memory", [])
+        set_memory("; ".join(n["text"] for n in notes[-25:]) if notes else "")
+
+    def remember(self, text):
+        text = (text or "").strip()
+        if not text:
+            return False
+        low = text.lower()
+        self._memory = [m for m in self._memory if m.get("text", "").lower() != low]
+        self._memory.append({"text": text, "t": time.time()})
+        self._memory = self._memory[-self.MEMORY_MAX:]
+        self._save_memory()
+        self._push_memory()
+        self._log("system", f"remembered: {text[:80]}")
+        return True
+
+    def forget(self, text=None):
+        if not text:
+            self._memory = []
+        else:
+            low = text.lower()
+            self._memory = [m for m in self._memory if low not in m.get("text", "").lower()]
+        self._save_memory()
+        self._push_memory()
 
     def _restore_behavior_state(self):
         # Every step is fenced: one failure here used to silently abort the

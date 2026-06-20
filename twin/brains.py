@@ -143,11 +143,25 @@ def get_self_state() -> str:
     return _SELF_STATE
 
 
+# Durable cross-session memory: short facts David asked Reachy to remember, loaded
+# from disk by the hub and re-set whenever they change. Survives restarts.
+_MEMORY = ""
+
+
+def set_memory(note: str):
+    global _MEMORY
+    _MEMORY = note or ""
+
+
 def reachy_system() -> str:
     """The one Reachy identity, current actions + live self-state baked in. Every
     brain feeds this to its engine, so Reachy is the same character (and equally
     self-aware) whether Local, Claude, or Marcus is running."""
     s = SYSTEM_TMPL.format(actions=get_actions_hint())
+    if _MEMORY:
+        s += (" THINGS YOU REMEMBER (David asked you to remember these and they persist "
+              "across all your chats, even after a restart -- treat them as true and use "
+              "them naturally when relevant): " + _MEMORY)
     if _SELF_STATE:
         s += (" YOUR BODY RIGHT NOW -- this is a LIVE reading of your own position at "
               "THIS instant; it is the truth and OVERRIDES anything you said earlier in "
