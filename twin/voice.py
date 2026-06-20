@@ -3,6 +3,7 @@
 Used by twin.hub (the panel's RobotHub) and twin.app (the standalone CLI loop).
 """
 import re
+import time
 
 import numpy as np
 
@@ -25,15 +26,22 @@ def _mono(s):
     return s.mean(axis=1) if getattr(s, "ndim", 1) == 2 else s
 
 
-def calibrate_floor(mini, n=40):
+def calibrate_floor(mini, n=60):
     vals = []
     for _ in range(n):
         s = mini.media.get_audio_sample()
         if s is not None and len(s):
             vals.append(_rms(_mono(s)))
-    # clamp the ceiling too: calibrating while audio happens to be playing
-    # (e.g. a reconnect mid-speech) would otherwise leave the mic half-deaf
-    return min(max((float(np.median(vals)) if vals else 0.001) * 4.0, 0.012), 0.045)
+        time.sleep(0.01)                 # space sampling over ~0.6s of ambient
+    if not vals:
+        return 0.02
+    # Use a LOW percentile = the genuine QUIET floor, NOT the median. Calibrating
+    # during a reconnect (its "toudoum" sound, or dropped-sample garbage from the
+    # "can't record fast enough" condition) inflated the median and pinned the gate
+    # at the old 0.045 ceiling -> he went deaf to "hey Reachy". The 20th percentile
+    # ignores those transients, and the ceiling is lowered to 0.030 as a backstop.
+    floor = float(np.percentile(vals, 20))
+    return min(max(floor * 4.0, 0.012), 0.030)
 
 
 def detect_switch(text, current):
