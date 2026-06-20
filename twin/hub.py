@@ -166,6 +166,8 @@ class RobotHub:
         self._supervisor_thread = None
         self._supervisor_stop = threading.Event()
         self._last_kick = 0.0
+        self._write_fails = 0                 # consecutive motor-WRITE failures (dead write-link guard)
+        self._last_write_ok = 0.0             # wall-clock of the last successful motor write
         self._thinking = threading.Event()   # set while a brain works; drives antenna flutter
         self._recording_gesture = False      # behaviors pause while limp for hand-guiding
         os.makedirs(GESTURE_DIR, exist_ok=True)
@@ -204,6 +206,7 @@ class RobotHub:
             raise
         self.mini = mini           # publish only once fully usable
         self.last_error = None
+        self._write_fails = 0      # fresh link: clear any stale dead-write count
         self._start_mic_pump(mini)
         try:
             self._load_moves()
@@ -354,6 +357,16 @@ class RobotHub:
             if link_fails >= 2:                 # two strikes -> rebuild the link
                 self._log("system", "robot link stale -- reconnecting")
                 link_fails = 0
+                self._teardown_mini()
+                continue
+            # Dead WRITE link: the read probe above can pass while motor WRITES
+            # silently fail -- he freezes mid-pose (and once fell over). Motor
+            # writes report via _note_write; a few consecutive failures with no
+            # success between them means the write/stream link is dead, so rebuild
+            # it the same way (teardown -> auto-reconnect next tick).
+            if self._write_fails >= 3:
+                self._log("system", "motor write link dead -- reconnecting")
+                self._write_fails = 0
                 self._teardown_mini()
                 continue
             # camera liveness: motors can survive a replug while the daemon's
@@ -1365,8 +1378,9 @@ class RobotHub:
             with self._lock:
                 self.mini.goto_target(head=head, body_yaw=np.deg2rad(body),
                                       duration=self.IDLE_TICK_S * 1.4)
+            self._note_write(True)
         except Exception:
-            pass
+            self._note_write(False)
 
     def _detect_faces(self, frame):
         import os
@@ -2285,6 +2299,19 @@ class RobotHub:
         lim = self._JOG_LIMITS.get(part, self.HEAD_YAW_SAFE)
         return max(-lim, min(lim, v))
 
+    def _note_write(self, ok):
+        """Feed the dead-write-link detector. The daemon's READ channel can keep
+        answering (so /api/state shows 'connected') while its WRITE/stream link is
+        dead and the motors are silently frozen -- a stuck pose + dead writes once
+        toppled him. Every motor write reports here; the supervisor rebuilds the
+        link after a few consecutive failures. A single success resets the count,
+        so transient blips never trigger a needless reconnect."""
+        if ok:
+            self._write_fails = 0
+            self._last_write_ok = time.time()
+        else:
+            self._write_fails += 1
+
     def _apply_pose(self):
         mini = self.mini                       # snapshot: the supervisor may null it mid-call
         if mini is None:
@@ -2313,7 +2340,9 @@ class RobotHub:
             with self._lock:
                 mini.goto_target(head=head, body_yaw=np.deg2rad(p["body"]),
                                  antennas=ant, duration=dur)
+            self._note_write(True)
         except Exception as e:                 # link dropped mid-move -> don't 500 the endpoint
+            self._note_write(False)
             self._log("system", f"apply_pose failed (link?): {e}")
         return dict(self._pose)
 
@@ -2482,7 +2511,9 @@ class RobotHub:
                     mini.set_target(head=head, body_yaw=body_yaw, antennas=ant)
                 else:                              # older SDK: short goto approximates streaming
                     mini.goto_target(head=head, body_yaw=body_yaw, antennas=ant, duration=0.08)
+            self._note_write(True)
         except Exception as e:                     # link dropped mid-stream -> don't 500 the endpoint
+            self._note_write(False)
             self._log("system", f"stream_target failed (link?): {e}")
         self._mark_manual()
         return self._target_state(tx, ty, tz)
