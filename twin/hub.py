@@ -1090,9 +1090,15 @@ class RobotHub:
     # code deploy silently turned room memory and the voice gate back off.
     _PERSISTED_BEHAVIORS = ("room_memory", "only_david", "wake_word", "room_listen")
     WAKE_WINDOW = 25.0      # seconds of active command-listening after "hey Reachy"
-    # Lenient wake phrase: Whisper mangles "Reachy" (reach/reachy/richie/ritchie/
-    # "reach he"), so match the family. Bias to catch it — a miss = he ignores you.
-    REACHY_WAKE = re.compile(r"\b(hey\s+|ok\s+|okay\s+)?(reach\w*|rich\w*|rick\w*|ritchie|reachie)\b", re.I)
+    # Wake phrase, tuned to ignore background TV/YouTube. Whisper mangles "Reachy"
+    # (reach/reachy/richie/ritchie/ricky/"reach he"), so we still match the family --
+    # but bare "reach"/"rich"/"rick" are COMMON WORDS that kept false-waking him on
+    # video audio, so those need an address cue ("hey"/"ok"). Distinctive name-forms
+    # ending -y/-ie wake him on their own. (a) cue + lenient family, or (b) clear name.
+    REACHY_WAKE = re.compile(
+        r"\b(?:hey|ok|okay)\s+(?:reach\w*|rich\w*|rick\w*|ritchie|reachie)\b"
+        r"|\b(?:reachy|reachie|reachee|ritchie|richie|richy|ricky|rickey)\b",
+        re.I)
     # Strip a LEADING self-address ("Reachy,", "Hey Ricky," -- STT mishears the name) before
     # handing the command to the brain, so a small model never parrots the misheard name back.
     # Leading-anchored, so mid-sentence words ("I feel rich") are untouched.
