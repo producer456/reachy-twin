@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reachy — Live Log</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#21262d; --txt:#c9d1d9; --dim:#8b949e;
+    --ok:#3fb950; --bad:#f85149; --warn:#d29922; --you:#58a6ff; --reachy:#a371f7;
+    --sys:#6e7681;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font:21px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{position:sticky;top:0;z-index:5;background:var(--panel);
+    border-bottom:1px solid var(--line);padding:14px 18px}
+  .title{display:flex;align-items:center;gap:12px;font-size:28px;font-weight:600;
+    letter-spacing:.3px;margin-bottom:12px}
+  .title .live{font-size:16px;color:var(--dim);font-weight:400;margin-left:auto}
+  .pills{display:flex;flex-wrap:wrap;gap:9px}
+  .pill{display:inline-flex;align-items:center;gap:8px;background:#0d1117;
+    border:1px solid var(--line);border-radius:999px;padding:6px 15px;font-size:18px}
+  .pill b{color:#fff;font-weight:600}
+  .dot{width:13px;height:13px;border-radius:50%;background:var(--sys);flex:none}
+  .dot.ok{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+  .dot.bad{background:var(--bad);box-shadow:0 0 7px var(--bad)}
+  .dot.warn{background:var(--warn);box-shadow:0 0 7px var(--warn)}
+  #feed{padding:8px 0 56px}
+  .row{display:flex;gap:14px;padding:5px 18px;border-left:4px solid transparent;
+    white-space:pre-wrap;word-break:break-word}
+  .row:hover{background:#11161d}
+  .row .t{color:var(--sys);flex:none;font-variant-numeric:tabular-nums}
+  .row .who{flex:none;width:96px;text-align:right;color:var(--dim)}
+  .row .msg{flex:1}
+  .who-you   .who{color:var(--you)}      .who-you{border-left-color:var(--you)}
+  .who-reachy .who{color:var(--reachy)}  .who-reachy{border-left-color:var(--reachy)}
+  .who-system .who{color:var(--sys)}
+  .lvl-bad{background:rgba(248,81,73,.10);border-left-color:var(--bad)!important}
+  .lvl-bad .msg{color:#ff9d96}
+  .lvl-warn{background:rgba(210,153,34,.09);border-left-color:var(--warn)!important}
+  .lvl-warn .msg{color:#e3b341}
+  .lvl-good .msg{color:var(--ok)}
+  #jump{position:fixed;right:20px;bottom:20px;background:var(--you);color:#001;
+    border:none;border-radius:999px;padding:12px 20px;font:600 18px ui-monospace,monospace;
+    cursor:pointer;display:none;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+  .empty{color:var(--dim);padding:24px 18px;font-size:18px}
+</style>
+</head>
+<body>
+<header>
+  <div class="title">🤖 Reachy — Live Log
+    <span class="live" id="live">connecting…</span>
+  </div>
+  <div class="pills" id="pills"></div>
+</header>
+<div id="feed"><div class="empty">waiting for the hub…</div></div>
+<button id="jump">↓ live</button>
+
+<script>
+const POLL_MS = 1500;
+const feed = document.getElementById('feed');
+const pills = document.getElementById('pills');
+const live = document.getElementById('live');
+const jump = document.getElementById('jump');
+const seen = new Set();          // dedupe key: t|who|text
+let first = true, stick = true;  // autoscroll unless user scrolled up
+
+// --- classify an event into a severity level + who-bucket ---------------
+const BAD = /(link dead|lost connection|speech error|restarting daemon|has no robot|error|failed|crash|dead|503|timeout|did not complete)/i;
+const WARN = /(reconnect|stream died|asleep|going quiet|gate: ignored|hallucination|degraded|retry|stale|busy|browns?out)/i;
+const GOOD = /(online|awake|restore|connected|enrolled|ready|✓|🎉)/i;
+
+function level(who, text){
+  if (BAD.test(text)) return 'bad';
+  if (WARN.test(text)) return 'warn';
+  if (who === 'you') return '';            // user speech: neutral
+  if (GOOD.test(text)) return 'good';
+  return '';
+}
+function whoBucket(who){
+  if (who === 'you') return 'you';
+  if (who === 'system') return 'system';
+  return 'reachy';                          // local / marcus / claude / reachy
+}
+function hhmmss(t){
+  const d = new Date(t*1000);
+  return d.toTimeString().slice(0,8);
+}
+
+function addRow(e){
+  const key = e.t+'|'+e.who+'|'+e.text;
+  if (seen.has(key)) return;
+  seen.add(key);
+  const lvl = level(e.who, e.text);
+  const row = document.createElement('div');
+  row.className = 'row who-'+whoBucket(e.who)+(lvl?(' lvl-'+lvl):'');
+  row.innerHTML =
+    '<span class="t"></span><span class="who"></span><span class="msg"></span>';
+  row.children[0].textContent = hhmmss(e.t);
+  row.children[1].textContent = e.who;
+  row.children[2].textContent = e.text;
+  feed.appendChild(row);
+}
+
+function renderPills(d){
+  const robot = d.robot === 'connected';
+  const items = [
+    ['robot', d.robot, robot?'ok':'bad'],
+    ['listening', d.listening?'on':'off', d.listening?'ok':'sys'],
+    ['dog_mode', d.behaviors?.dog_mode?'on':'off', d.behaviors?.dog_mode?'ok':'sys'],
+    ['state', d.asleep?'asleep':'awake', d.asleep?'warn':'ok'],
+    ['brain', d.active, 'sys'],
+    ['volume', d.volume, 'sys'],
+  ];
+  if (d.behaviors){
+    const on = ['turn_to_sound','face_track','idle_motion','room_memory','only_david','wake_word','room_listen']
+      .filter(k=>d.behaviors[k]);
+    if (on.length) items.push(['+', on.join(' '), 'sys']);
+  }
+  pills.innerHTML = items.map(([k,v,c])=>{
+    const dot = (c==='ok'||c==='bad'||c==='warn')?`<span class="dot ${c}"></span>`:'';
+    return `<span class="pill">${dot}${k}: <b>${v}</b></span>`;
+  }).join('');
+}
+
+async function tick(){
+  try{
+    const r = await fetch('/api/state', {cache:'no-store'});
+    if (!r.ok) throw new Error(r.status);
+    const d = await r.json();
+    renderPills(d);
+    if (first){ feed.innerHTML=''; first=false; }
+    (d.log||[]).forEach(addRow);
+    if (stick) feed.scrollIntoView(false), window.scrollTo(0, document.body.scrollHeight);
+    live.textContent = 'live · '+new Date().toTimeString().slice(0,8);
+    live.style.color = 'var(--ok)';
+  }catch(err){
+    live.textContent = 'hub unreachable — retrying… ('+err.message+')';
+    live.style.color = 'var(--bad)';
+  }
+}
+
+// keep autoscroll only when the user is near the bottom
+addEventListener('scroll', ()=>{
+  const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 60;
+  stick = nearBottom;
+  jump.style.display = nearBottom ? 'none' : 'block';
+});
+jump.onclick = ()=>{ stick=true; jump.style.display='none'; window.scrollTo(0, document.body.scrollHeight); };
+
+tick();
+setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>
